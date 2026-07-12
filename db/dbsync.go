@@ -61,7 +61,8 @@ func syncDB() {
 		var js *fdb.FDBRequest
 		err = json.NewDecoder(resp.Body).Decode(&js)
 		if err != nil {
-			log.Fatal("Error decode json:", err)
+			log.Println("Error decode json:", err)
+			return
 			return
 		}
 		resp.Body.Close()

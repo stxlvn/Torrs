@@ -36,31 +36,31 @@ func ShowQueue(c tele.Context) error {
 		msg += "Закачиваются:\n"
 		i := 0
 		for _, dlQueue := range manager.working {
-			s := "#" + strconv.Itoa(i+1) + ": <code>" + dlQueue.torrentHash + "</code>\n"
+			s := "#" + strconv.Itoa(i+1) + ": <code>" + dlQueue.torrentHash + "</code> (" + strconv.Itoa(len(dlQueue.fileIndices)) + " файлов)\n"
 			if len(msg+s) > 1024 {
-				c.Send(msg)
+				c.Send(msg, tele.ModeHTML)
 				msg = ""
 			}
 			msg += s
 			i++
 		}
 		if len(msg) > 0 {
-			c.Send(msg)
+			c.Send(msg, tele.ModeHTML)
 			msg = ""
 		}
 	}
 	if len(manager.queue) > 0 {
 		msg = "В очереди:\n"
 		for i, dlQueue := range manager.queue {
-			s := "#" + strconv.Itoa(i+1) + ": <code>" + dlQueue.torrentHash + "</code>\n"
+			s := "#" + strconv.Itoa(i+1) + ": <code>" + dlQueue.torrentHash + "</code> (" + strconv.Itoa(len(dlQueue.fileIndices)) + " файлов)\n"
 			if len(msg+s) > 1024 {
-				c.Send(msg)
+				c.Send(msg, tele.ModeHTML)
 				msg = ""
 			}
 			msg += s
 		}
 		if len(msg) > 0 {
-			c.Send(msg)
+			c.Send(msg, tele.ModeHTML)
 			msg = ""
 		}
 	}
@@ -81,47 +81,68 @@ func updateLoadStatus(wrk *Worker, file *TorrFile, fi, fc int) {
 	}
 	ti, err := GetTorrentInfo(wrk.torrentHash)
 	if err != nil {
-		wrk.c.Bot().Edit(wrk.msg, "Ошибка при получении данных о торренте")
+		wrk.c.Bot().Edit(wrk.msg, "Ошибка при получении данных о торренте", tele.ModeHTML)
+		return
 	} else if wrk.isCancelled {
-		wrk.c.Bot().Edit(wrk.msg, "Остановка...")
-	} else {
-		wrk.c.Send(tele.UploadingVideo)
-		if ti.DownloadSpeed == 0 {
-			ti.DownloadSpeed = 1.0
-		}
-		wait := time.Duration(float64(file.Loaded())/ti.DownloadSpeed) * time.Second
-		speed := humanize.Bytes(uint64(ti.DownloadSpeed)) + "/sec"
-		peers := fmt.Sprintf("%v · %v/%v", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
-		prc := fmt.Sprintf("%.2f%% %v / %v", float64(file.offset)*100.0/float64(file.size), humanize.Bytes(uint64(file.offset)), humanize.Bytes(uint64(file.size)))
-
-		name := file.name
-		if name == ti.Title {
-			name = ""
-		}
-
-		msg := "Загрузка торрента:\n" +
-			"<b>" + ti.Title + "</b>\n"
-		if name != "" {
-			msg += "<i>" + name + "</i>\n"
-		}
-		msg += "<b>Хэш:</b> <code>" + file.hash + "</code>\n"
-		if file.offset < file.size {
-			msg += "<b>Скорость: </b>" + speed + "\n" +
-				"<b>Осталось: </b>" + wait.String() + "\n" +
-				"<b>Пиры: </b>" + peers + "\n" +
-				"<b>Загружено: </b>" + prc
-		}
-		if fc > 1 {
-			msg += "\n<b>Файлов: </b>" + strconv.Itoa(fi) + "/" + strconv.Itoa(fc)
-		}
-		if file.offset >= file.size {
-			msg += "\n<b>Завершение загрузки, это займет некоторое время</b>"
-			wrk.c.Bot().Edit(wrk.msg, msg)
-			return
-		}
-
-		torrKbd := &tele.ReplyMarkup{}
-		torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
-		wrk.c.Bot().Edit(wrk.msg, msg, torrKbd)
+		wrk.c.Bot().Edit(wrk.msg, "Остановка...", tele.ModeHTML)
+		return
 	}
+
+	wrk.c.Send(tele.UploadingVideo)
+	if ti.DownloadSpeed == 0 {
+		ti.DownloadSpeed = 1.0
+	}
+
+	wait := time.Duration(float64(file.Loaded())/ti.DownloadSpeed) * time.Second
+	speed := humanize.Bytes(uint64(ti.DownloadSpeed)) + "/sec"
+	peers := fmt.Sprintf("%v (%v/%v)", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
+
+	// Прогресс текущего файла (от 0 до 1)
+	filePercent := 0.0
+	if file.size > 0 {
+		filePercent = float64(file.offset) / float64(file.size)
+	}
+	if filePercent > 1.0 {
+		filePercent = 1.0
+	}
+
+	// Глобальный прогресс по всем скачиваемым файлам (от 0 до 100%)
+	globalPercent := (float64(fi-1) + filePercent) / float64(fc) * 100.0
+	if globalPercent > 100.0 {
+		globalPercent = 100.0
+	}
+
+	downloadedStr := humanize.Bytes(uint64(file.offset))
+	totalStr := humanize.Bytes(uint64(file.size))
+
+	// Формируем комбинированное сообщение
+	msg := "🚀 <b>Обработка торрента...</b>\n\n"
+	msg += "💿 <b>Название:</b> " + ti.Title + "\n"
+	if fc > 1 {
+		msg += "📦 <b>Файлы:</b> " + strconv.Itoa(fi) + " из " + strconv.Itoa(fc) + "\n\n"
+	} else {
+		msg += "\n"
+	}
+
+	msg += "📥 <b>Скачивание на сервер:</b>\n"
+	if file.offset < file.size {
+		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
+		msg += fmt.Sprintf("Данные: %s / %s\n", downloadedStr, totalStr)
+		msg += fmt.Sprintf("Скорость: %s | Пиры: %s\n", speed, peers)
+		msg += fmt.Sprintf("Осталось: %s\n\n", wait.String())
+	} else {
+		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
+		msg += "⏳ <i>Финализация файла...</i>\n\n"
+	}
+
+	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
+	msg += fmt.Sprintf("Прогресс: [%s] 0.00%%\n", GetProgressBar(0.0))
+	msg += "⏳ <i>Ожидание скачивания файлов...</i>\n\n"
+
+	msg += "⚙️ <code>" + file.hash + "</code>"
+
+	// Кнопка отмены теперь всегда присутствует на этапе загрузки, даже при финализации
+	torrKbd := &tele.ReplyMarkup{}
+	torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
+	wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
 }

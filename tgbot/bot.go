@@ -3,18 +3,21 @@ package tgbot
 import (
 	"errors"
 	"fmt"
-	initdata "github.com/telegram-mini-apps/init-data-golang"
-	tele "gopkg.in/telebot.v4"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/anacrolix/torrent/metainfo"
+	initdata "github.com/telegram-mini-apps/init-data-golang"
+	tele "gopkg.in/telebot.v4"
 	"torrsru/global"
 	"torrsru/tgbot/torr"
 )
 
 func Start(token, host string) error {
+	fmt.Println("=== BOT VERSION 2026-07-12-audio ===")
 	pref := tele.Settings{
 		URL:       host,
 		Token:     token,
@@ -27,6 +30,9 @@ func Start(token, host string) error {
 	if err != nil {
 		return err
 	}
+
+	// Регистрируем обработчик аудиофайлов в менеджере загрузок
+	torr.AudioProcessor = ProcessAudioFile
 
 	b.Handle("help", help)
 	b.Handle("Help", help)
@@ -68,22 +74,71 @@ func Start(token, host string) error {
 		}
 	})
 
+	// Обработчик фотографий – потенциально обложка для аудио
+	b.Handle(tele.OnPhoto, func(c tele.Context) error {
+		chatID := c.Sender().ID
+		var found *PendingCover
+		pendingCovers.Range(func(key, value interface{}) bool {
+			pc := value.(*PendingCover)
+			if strings.HasPrefix(key.(string), fmt.Sprintf("%d_", chatID)) {
+				found = pc
+				return false
+			}
+			return true
+		})
+		if found != nil {
+			return handleCustomCoverUpload(c, found.Hash, c.Message())
+		}
+		return nil
+	})
+
+	// Единый обработчик документов: торрент-файлы и пользовательские обложки
+	b.Handle(tele.OnDocument, func(c tele.Context) error {
+		doc := c.Message().Document
+
+		// 1. Если это торрент-файл – обрабатываем как раздачу
+		if strings.HasSuffix(strings.ToLower(doc.FileName), ".torrent") {
+			rc, err := b.File(&doc.File)
+			if err != nil {
+				return nil
+			}
+			defer rc.Close()
+			meta, err := metainfo.Load(rc)
+			if err != nil {
+				return c.Send("❌ Ошибка: битый торрент-файл.")
+			}
+			return infoTorrent(c, meta.HashInfoBytes().HexString())
+		}
+
+		// 2. Проверяем, не ожидается ли загрузка обложки для аудио
+		chatID := c.Sender().ID
+		var found *PendingCover
+		pendingCovers.Range(func(key, value interface{}) bool {
+			pc := value.(*PendingCover)
+			if strings.HasPrefix(key.(string), fmt.Sprintf("%d_", chatID)) {
+				found = pc
+				return false
+			}
+			return true
+		})
+		if found != nil {
+			return handleCustomCoverUpload(c, found.Hash, c.Message())
+		}
+
+		return nil
+	})
+
+	// Универсальный обработчик callback – всё делегируется в getTorrent
 	b.Handle(tele.OnCallback, func(c tele.Context) error {
 		args := c.Args()
 		if len(args) > 0 {
-			if args[0] == "\ffile" || args[0] == "\fall" {
-				return getTorrent(c)
-			}
-			if args[0] == "\ftorr" {
+			cmd := strings.TrimSpace(args[0])
+			// Команда \ftorr обрабатывается отдельно (информация о торренте)
+			if cmd == "\ftorr" {
 				return infoTorrent(c, args[1])
 			}
-			if args[0] == "\fcancel" {
-				if num, err := strconv.Atoi(args[1]); err == nil {
-					torr.Cancel(num)
-					c.Bot().Delete(c.Callback().Message)
-					return nil
-				}
-			}
+			// Все остальные callback'и (включая \fcancel, \fcover, \fskip и т.д.) идут в getTorrent
+			return getTorrent(c)
 		}
 		return errors.New("Ошибка кнопка не распознана")
 	})
@@ -136,16 +191,13 @@ func help(c tele.Context) error {
 
 func ParseRange(rng string) (int, int, error) {
 	parts := strings.Split(rng, "-")
-
 	if len(parts) != 2 {
 		return -1, -1, errors.New("Неверный формат строки")
 	}
-
 	num1, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
 	if err1 != nil {
 		return -1, -1, err1
 	}
-
 	num2, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err2 != nil {
 		return -1, -1, err2

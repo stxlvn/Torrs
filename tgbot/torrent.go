@@ -3,91 +3,525 @@ package tgbot
 import (
 	"errors"
 	"fmt"
-	"github.com/dustin/go-humanize"
-	tele "gopkg.in/telebot.v4"
-	"path/filepath"
+	"hash/crc32"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/dustin/go-humanize"
+	tele "gopkg.in/telebot.v4"
 	"torrsru/tgbot/torr"
+	"torrsru/tgbot/torr/state"
 )
 
+// Состояние сессии пользователя для конкретного торрента
+type UserState struct {
+	CurrentDir string
+	Page       int
+	Selections map[int]bool // id файла -> выбрано
+}
+
+var (
+	userStates sync.Map // Ключ: "{chatID}_{hash}" -> *UserState
+	pathMap    sync.Map // Ключ: uint32 (хэш пути) -> string (полный путь)
+)
+
+const PageSize = 10
+
+// Получает или создает состояние пользователя
+func getUserState(chatID int64, hash string) *UserState {
+	key := fmt.Sprintf("%d_%s", chatID, hash)
+	if v, ok := userStates.Load(key); ok {
+		return v.(*UserState)
+	}
+	us := &UserState{
+		CurrentDir: "",
+		Page:       0,
+		Selections: make(map[int]bool),
+	}
+	userStates.Store(key, us)
+	return us
+}
+
 func infoTorrent(c tele.Context, magnet string) error {
-	msg, err := c.Bot().Send(c.Recipient(), "Подключение к торренту: <code>"+magnet+"</code>")
+	msg, err := c.Bot().Send(c.Recipient(), "🔍 Ищу информацию о раздаче... <code>"+magnet+"</code>", tele.ModeHTML)
 	if err != nil {
 		fmt.Println("Error send to telegram:", err)
 		return err
 	}
 	ti, err := torr.GetTorrentInfo(magnet)
 	if err != nil {
-		_, err = c.Bot().Edit(msg, "Ошибка при подключении к торренту <code>"+magnet+"</code>")
+		msgErr, _ := c.Bot().Edit(msg, "⚠️ Не удалось достучаться до торрента <code>"+magnet+"</code>", tele.ModeHTML)
+		go func() { time.Sleep(5 * time.Second); c.Bot().Delete(msgErr) }()
 		return err
 	}
 
 	c.Bot().Delete(msg)
 
+	// Если в торренте всего 1 файл, качаем сразу без меню
 	if len(ti.FileStats) == 1 {
 		torr.AddRange(c, ti.Hash, ti.FileStats[0].Id, ti.FileStats[0].Id)
 		return nil
 	}
 
-	txt := "<b>" + ti.Title + "</b>\n" +
-		"<code>" + ti.Hash + "</code>"
+	// Сбрасываем состояние при новом поиске
+	key := fmt.Sprintf("%d_%s", c.Sender().ID, ti.Hash)
+	userStates.Delete(key)
+
+	us := getUserState(c.Sender().ID, ti.Hash)
+
+	// АВТОРАСКРЫТИЕ КОРНЕВОЙ ПАПКИ
+	if len(ti.FileStats) > 0 {
+		commonRoot := ""
+		isSingleRoot := true
+		for _, f := range ti.FileStats {
+			idx := strings.Index(f.Path, "/")
+			if idx != -1 {
+				rootFolder := f.Path[:idx+1]
+				if commonRoot == "" {
+					commonRoot = rootFolder
+				} else if commonRoot != rootFolder {
+					isSingleRoot = false
+					break
+				}
+			} else {
+				isSingleRoot = false
+				break
+			}
+		}
+		if isSingleRoot && commonRoot != "" {
+			us.CurrentDir = commonRoot
+		}
+	}
+
+	return renderTorrentPage(c, ti)
+}
+
+// Элемент виртуальной файловой системы (Папка или Файл)
+type VfsItem struct {
+	IsFile   bool
+	Name     string
+	FullPath string
+	FileID   int
+	Size     int64
+	Selected bool
+}
+
+func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
+	us := getUserState(c.Sender().ID, ti.Hash)
+
+	// Собираем виртуальную файловую систему для текущей директории
+	dirSet := make(map[string]struct{})
+	var items []VfsItem
+
+	for _, f := range ti.FileStats {
+		if !strings.HasPrefix(f.Path, us.CurrentDir) {
+			continue
+		}
+		relPath := f.Path[len(us.CurrentDir):]
+
+		if idx := strings.Index(relPath, "/"); idx != -1 {
+			dirName := relPath[:idx]
+			if _, exists := dirSet[dirName]; !exists {
+				dirSet[dirName] = struct{}{}
+				items = append(items, VfsItem{
+					IsFile:   false,
+					Name:     dirName,
+					FullPath: us.CurrentDir + dirName + "/",
+				})
+			}
+		} else {
+			items = append(items, VfsItem{
+				IsFile:   true,
+				Name:     relPath,
+				FullPath: f.Path,
+				FileID:   f.Id,
+				Size:     f.Length,
+				Selected: us.Selections[f.Id],
+			})
+		}
+	}
+
+	// Сортируем: папки сверху, потом файлы, всё по алфавиту
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsFile != items[j].IsFile {
+			return !items[i].IsFile
+		}
+		return items[i].Name < items[j].Name
+	})
+
+	totalItems := len(items)
+	totalPages := (totalItems + PageSize - 1) / PageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if us.Page >= totalPages {
+		us.Page = totalPages - 1
+	}
+
+	displayDir := us.CurrentDir
+	if displayDir == "" {
+		displayDir = "/"
+	}
+	txt := fmt.Sprintf("<b>%s</b>\n<code>%s</code>\n\n📁 <b>Путь:</b> <code>%s</code>\n(Стр. %d из %d):",
+		ti.Title, ti.Hash, displayDir, us.Page+1, totalPages)
 
 	filesKbd := &tele.ReplyMarkup{}
-	var files []tele.Row
+	var rows []tele.Row
 
-	i := len(txt)
-	for _, f := range ti.FileStats {
-		btn := filesKbd.Data(filepath.Base(f.Path)+" "+humanize.Bytes(uint64(f.Length)), "file", ti.Hash, strconv.Itoa(f.Id))
-		files = append(files, filesKbd.Row(btn))
-		if i+len(txt) > 1024 {
-			filesKbd := &tele.ReplyMarkup{}
-			filesKbd.Inline(files...)
-			c.Send(txt, filesKbd)
-			files = files[:0]
-			i = len(txt)
+	start := us.Page * PageSize
+	end := start + PageSize
+	if end > totalItems {
+		end = totalItems
+	}
+
+	for _, item := range items[start:end] {
+		if item.IsFile {
+			status := "⬜️ "
+			if item.Selected {
+				status = "🟩 "
+			}
+			btnText := status + item.Name + " (" + humanize.Bytes(uint64(item.Size)) + ")"
+			btn := filesKbd.Data(btnText, "\ftog", ti.Hash, strconv.Itoa(item.FileID))
+			rows = append(rows, filesKbd.Row(btn))
+		} else {
+			// Хэш для пути папки (чтобы влезть в callback_data)
+			h := crc32.ChecksumIEEE([]byte(item.FullPath))
+			pathMap.Store(h, item.FullPath)
+			dirHash := strconv.FormatUint(uint64(h), 10)
+
+			// Кнопка входа в папку
+			btnFolder := filesKbd.Data("📁 "+item.Name, "\fdir", ti.Hash, dirHash)
+
+			// Чекбокс для папки: переключает выбор всех файлов внутри
+			isFullySelected := isDirFullySelected(ti, us, item.FullPath)
+			checkIcon := "⬜️"
+			if isFullySelected {
+				checkIcon = "🟩"
+			}
+			btnToggle := filesKbd.Data(checkIcon, "\ftogd", ti.Hash, dirHash)
+
+			rows = append(rows, filesKbd.Row(btnFolder, btnToggle))
 		}
-		i += len(filepath.Base(f.Path) + " " + humanize.Bytes(uint64(f.Length)))
 	}
 
-	if len(files) > 0 {
-		filesKbd.Inline(files...)
-		c.Send(txt, filesKbd)
+	// Навигация (вверх, страницы)
+	var navRow []tele.Btn
+	if us.CurrentDir != "" {
+		navRow = append(navRow, filesKbd.Data("⬆️ Наверх", "\fup", ti.Hash))
 	}
+	if us.Page > 0 {
+		navRow = append(navRow, filesKbd.Data("⬅️", "\fpage", ti.Hash, strconv.Itoa(us.Page-1)))
+	}
+	navRow = append(navRow, filesKbd.Data(fmt.Sprintf("📄 %d/%d", us.Page+1, totalPages), "\fnoop"))
+	if us.Page < totalPages-1 {
+		navRow = append(navRow, filesKbd.Data("➡️", "\fpage", ti.Hash, strconv.Itoa(us.Page+1)))
+	}
+	rows = append(rows, navRow)
 
-	if len(files) > 1 {
-		txt = "<b>" + ti.Title + "</b>\n" +
-			"<code>" + ti.Hash + "</code>\n" +
-			"Скачать все файлы? Всего:" + strconv.Itoa(len(ti.FileStats))
-		files = files[:0]
-		files = append(files, filesKbd.Row(filesKbd.Data("Скачать все файлы", "all", ti.Hash)))
-		filesKbd.Inline(files...)
-		c.Send(txt, filesKbd)
+	// Панель управления
+	btnDown := filesKbd.Data("📥 Скачать выбранное", "\fdown", ti.Hash)
+	rows = append(rows, filesKbd.Row(btnDown))
+
+	btnAllDir := filesKbd.Data("🚀 Скачать эту папку", "\fdall", ti.Hash)
+	btnCancel := filesKbd.Data("❌ Отмена", "\fcanc", ti.Hash)
+	rows = append(rows, filesKbd.Row(btnAllDir, btnCancel))
+
+	filesKbd.Inline(rows...)
+
+	if c.Callback() != nil {
+		_, err := c.Bot().Edit(c.Message(), txt, filesKbd, tele.ModeHTML)
+		return err
 	}
-	return nil
+	return c.Send(txt, filesKbd, tele.ModeHTML)
 }
 
 func getTorrent(c tele.Context) error {
 	args := c.Args()
-	if args[0] == "\ffile" {
-		if len(args) != 3 {
-			return errors.New("Ошибка не верные данные")
-		}
-		from, err := strconv.Atoi(args[2])
-		if err != nil {
-			return err
-		}
-		torr.AddRange(c, args[1], from, from)
-	} else if args[0] == "\fall" {
-		if len(args) != 2 {
-			return errors.New("Ошибка не верные данные")
-		}
-		torr.AddRange(c, args[1], 1, -1)
-	} else {
-		return errors.New("Ошибка не верные данные")
+	for i := range args {
+		args[i] = strings.TrimSpace(args[i])
+	}
+	if len(args) == 0 {
+		return errors.New("Ошибка: нет аргументов")
+	}
+	cmd := args[0]
+	if !strings.HasPrefix(cmd, "\f") {
+		cmd = "\f" + cmd
 	}
 
-	return nil
+	// Пустышка для индикатора страницы
+	if cmd == "\fnoop" {
+		return c.Respond()
+	}
+
+	// Отмена и закрытие меню
+	if cmd == "\fcanc" {
+		if len(args) >= 2 {
+			key := fmt.Sprintf("%d_%s", c.Sender().ID, args[1])
+			userStates.Delete(key)
+		}
+		c.Bot().Delete(c.Message())
+		return c.Respond(&tele.CallbackResponse{Text: "Меню закрыто"})
+	}
+
+	// Отмена загрузки (очередь)
+	if cmd == "\fcancel" {
+		if len(args) != 2 {
+			return errors.New("Ошибка данных")
+		}
+		num, err := strconv.Atoi(args[1])
+		if err != nil {
+			return c.Respond(&tele.CallbackResponse{Text: "Неверный ID"})
+		}
+		torr.Cancel(num)
+		c.Bot().Delete(c.Callback().Message)
+		return c.Respond(&tele.CallbackResponse{Text: "Отменено"})
+	}
+
+	// Переход внутрь папки
+	if cmd == "\fdir" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		dirHash, _ := strconv.ParseUint(args[2], 10, 32)
+
+		if fullPath, ok := pathMap.Load(uint32(dirHash)); ok {
+			us := getUserState(c.Sender().ID, hash)
+			us.CurrentDir = fullPath.(string)
+			us.Page = 0
+		}
+
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			return c.Respond(&tele.CallbackResponse{Text: "Ошибка торрента", ShowAlert: true})
+		}
+		renderTorrentPage(c, ti)
+		return c.Respond()
+	}
+
+	// Возврат на уровень вверх
+	if cmd == "\fup" {
+		if len(args) != 2 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		us := getUserState(c.Sender().ID, hash)
+
+		trimmed := strings.TrimSuffix(us.CurrentDir, "/")
+		lastSlash := strings.LastIndex(trimmed, "/")
+		if lastSlash == -1 {
+			us.CurrentDir = "" // Корень
+		} else {
+			us.CurrentDir = trimmed[:lastSlash+1]
+		}
+		us.Page = 0
+
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			return c.Respond()
+		}
+		renderTorrentPage(c, ti)
+		return c.Respond()
+	}
+
+	// Скачать всю текущую папку (с сортировкой)
+	if cmd == "\fdall" {
+		if len(args) != 2 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		us := getUserState(c.Sender().ID, hash)
+
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			return c.Respond(&tele.CallbackResponse{Text: "Ошибка торрента", ShowAlert: true})
+		}
+
+		var files []*state.TorrentFileStat
+		for _, f := range ti.FileStats {
+			if strings.HasPrefix(f.Path, us.CurrentDir) {
+				files = append(files, f)
+			}
+		}
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].Path < files[j].Path
+		})
+
+		count := 0
+		for _, f := range files {
+			torr.AddRange(c, hash, f.Id, f.Id)
+			count++
+		}
+
+		if count == 0 {
+			return c.Respond(&tele.CallbackResponse{Text: "Папка пуста!", ShowAlert: true})
+		}
+
+		key := fmt.Sprintf("%d_%s", c.Sender().ID, hash)
+		userStates.Delete(key)
+		c.Bot().Edit(c.Message(), fmt.Sprintf("✅ Добавлено файлов в очередь из папки: %d", count))
+		return c.Respond(&tele.CallbackResponse{Text: "Загрузка папки началась"})
+	}
+
+	// Переключение страницы
+	if cmd == "\fpage" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		page, _ := strconv.Atoi(args[2])
+
+		us := getUserState(c.Sender().ID, hash)
+		us.Page = page
+
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			return c.Respond(&tele.CallbackResponse{Text: "Ошибка загрузки данных", ShowAlert: true})
+		}
+		renderTorrentPage(c, ti)
+		return c.Respond()
+	}
+
+	// Переключение выбора файла
+	if cmd == "\ftog" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		id, _ := strconv.Atoi(args[2])
+
+		us := getUserState(c.Sender().ID, hash)
+		us.Selections[id] = !us.Selections[id]
+
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			return c.Respond()
+		}
+		renderTorrentPage(c, ti)
+		return c.Respond()
+	}
+
+	// Переключение выбора всей папки (ЧЕКБОКС)
+	if cmd == "\ftogd" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		dirHash, _ := strconv.ParseUint(args[2], 10, 32)
+
+		fullPath, ok := pathMap.Load(uint32(dirHash))
+		if !ok {
+			return c.Respond(&tele.CallbackResponse{
+				Text:      "Данные устарели. Откройте меню заново.",
+				ShowAlert: true,
+			})
+		}
+		path := fullPath.(string)
+
+		// Мгновенно отвечаем, чтобы кнопка не зависала
+		c.Respond(&tele.CallbackResponse{Text: "Переключаем..."})
+
+		us := getUserState(c.Sender().ID, hash)
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			c.Bot().Edit(c.Message(), "⚠️ Ошибка получения данных торрента")
+			return nil
+		}
+
+		newState := !isDirFullySelected(ti, us, path)
+		for _, f := range ti.FileStats {
+			if strings.HasPrefix(f.Path, path) {
+				us.Selections[f.Id] = newState
+			}
+		}
+		renderTorrentPage(c, ti)
+		return nil
+	}
+
+	// Скачать выбранные файлы (с сортировкой)
+	if cmd == "\fdown" {
+		if len(args) != 2 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		us := getUserState(c.Sender().ID, hash)
+
+		ti, err := torr.GetTorrentInfo(hash)
+		if err != nil {
+			return c.Respond(&tele.CallbackResponse{Text: "Ошибка получения данных", ShowAlert: true})
+		}
+
+		idToPath := make(map[int]string)
+		for _, f := range ti.FileStats {
+			idToPath[f.Id] = f.Path
+		}
+
+		var selectedIDs []int
+		for id, sel := range us.Selections {
+			if sel {
+				selectedIDs = append(selectedIDs, id)
+			}
+		}
+		if len(selectedIDs) == 0 {
+			return c.Respond(&tele.CallbackResponse{Text: "Вы ничего не выбрали!", ShowAlert: true})
+		}
+
+		sort.Slice(selectedIDs, func(i, j int) bool {
+			return idToPath[selectedIDs[i]] < idToPath[selectedIDs[j]]
+		})
+
+		count := 0
+		for _, id := range selectedIDs {
+			torr.AddRange(c, hash, id, id)
+			count++
+		}
+
+		key := fmt.Sprintf("%d_%s", c.Sender().ID, hash)
+		userStates.Delete(key)
+		c.Bot().Edit(c.Message(), "✅ Добавлено файлов в очередь: "+strconv.Itoa(count))
+		return c.Respond(&tele.CallbackResponse{Text: "Загрузка началась"})
+	}
+
+	// === ОБРАБОТЧИКИ ОБЛОЖЕК ===
+	// Выбор обложки из списка
+	if cmd == "\fcover" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		idx, _ := strconv.Atoi(args[2])
+		return handleCoverSelection(c, hash, idx)
+	}
+
+	// Загрузка своей обложки
+	if cmd == "\fcovup" {
+		// просто отвечаем, данные уже в pendingCovers
+		return c.Respond(&tele.CallbackResponse{Text: "Отправьте изображение"})
+	}
+
+	// Пропустить выбор обложки (отправить как есть)
+	if cmd == "\fskip" {
+		if len(args) != 2 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		return handleCoverSkip(c, hash)
+	}
+
+	return errors.New("Неизвестная команда")
+}
+
+// Проверяет, выбраны ли все файлы внутри указанной папки
+func isDirFullySelected(ti *state.TorrentStatus, us *UserState, path string) bool {
+	for _, f := range ti.FileStats {
+		if strings.HasPrefix(f.Path, path) && !us.Selections[f.Id] {
+			return false
+		}
+	}
+	return true
 }
 
 func isHash(txt string) bool {
