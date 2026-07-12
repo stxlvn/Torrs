@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,10 +27,82 @@ type UserState struct {
 
 var (
 	userStates sync.Map // Ключ: "{chatID}_{hash}" -> *UserState
-	pathMap    sync.Map // Ключ: uint32 (хэш пути) -> string (полный путь)
+	pathMap    sync.Map // Ключ: uint32 (хэш chatID+hash+пути) -> *pathEntry
 )
 
 const PageSize = 10
+
+// pathMapTTL — время жизни записи в pathMap. Раньше записи не удалялись
+// вообще, что приводило к неограниченному росту памяти на долгоживущем
+// процессе (запись создаётся на каждую отрисованную папку каждого
+// пользователя). Хэш также раньше считался только от FullPath, из-за чего
+// два разных пользователя (или два разных торрента) могли получить
+// одинаковый 32-битный хэш и попасть в чужую папку — теперь ключ включает
+// chatID и hash торрента.
+const pathMapTTL = 6 * time.Hour
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		for range ticker.C {
+			now := time.Now()
+			pathMap.Range(func(k, v interface{}) bool {
+				if now.Sub(v.(*pathEntry).ts) > pathMapTTL {
+					pathMap.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
+}
+
+type pathEntry struct {
+	path string
+	ts   time.Time
+}
+
+func pathMapKey(chatID int64, hash, fullPath string) uint32 {
+	return crc32.ChecksumIEEE([]byte(fmt.Sprintf("%d|%s|%s", chatID, hash, fullPath)))
+}
+
+// naturalLess сравнивает строки "по-человечески": числовые подстроки
+// сравниваются как числа, а не посимвольно — иначе plain "<" ставит "10"
+// перед "2" (лексикографически "1" < "2"). Разбивает обе строки на
+// чередующиеся куски цифр/нецифр и сравнивает кусок за куском.
+func naturalLess(a, b string) bool {
+	ai, bi := 0, 0
+	for ai < len(a) && bi < len(b) {
+		ac, bc := a[ai], b[bi]
+		if isDigit(ac) && isDigit(bc) {
+			aStart, bStart := ai, bi
+			for ai < len(a) && isDigit(a[ai]) {
+				ai++
+			}
+			for bi < len(b) && isDigit(b[bi]) {
+				bi++
+			}
+			aNum := strings.TrimLeft(a[aStart:ai], "0")
+			bNum := strings.TrimLeft(b[bStart:bi], "0")
+			if len(aNum) != len(bNum) {
+				return len(aNum) < len(bNum)
+			}
+			if aNum != bNum {
+				return aNum < bNum
+			}
+			continue
+		}
+		if ac != bc {
+			return ac < bc
+		}
+		ai++
+		bi++
+	}
+	return len(a)-ai < len(b)-bi
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
 
 // Получает или создает состояние пользователя
 func getUserState(chatID int64, hash string) *UserState {
@@ -46,17 +120,20 @@ func getUserState(chatID int64, hash string) *UserState {
 }
 
 func infoTorrent(c tele.Context, magnet string) error {
+	log.Printf("[torrent] infoTorrent: user=%d запрос=%s", c.Sender().ID, magnet)
 	msg, err := c.Bot().Send(c.Recipient(), "🔍 Ищу информацию о раздаче... <code>"+magnet+"</code>", tele.ModeHTML)
 	if err != nil {
-		fmt.Println("Error send to telegram:", err)
+		log.Printf("[torrent] infoTorrent: не удалось отправить сообщение: %v", err)
 		return err
 	}
 	ti, err := torr.GetTorrentInfo(magnet)
 	if err != nil {
+		log.Printf("[torrent] infoTorrent: GetTorrentInfo(%s) FAILED: %v", magnet, err)
 		msgErr, _ := c.Bot().Edit(msg, "⚠️ Не удалось достучаться до торрента <code>"+magnet+"</code>", tele.ModeHTML)
 		go func() { time.Sleep(5 * time.Second); c.Bot().Delete(msgErr) }()
 		return err
 	}
+	log.Printf("[torrent] infoTorrent: %s -> hash=%s название=%q файлов=%d", magnet, ti.Hash, ti.Title, len(ti.FileStats))
 
 	c.Bot().Delete(msg)
 
@@ -72,14 +149,15 @@ func infoTorrent(c tele.Context, magnet string) error {
 
 	us := getUserState(c.Sender().ID, ti.Hash)
 
-	// АВТОРАСКРЫТИЕ КОРНЕВОЙ ПАПКИ
+	// АВТОРАСКРЫТИЕ КОРНЕВОЙ ПАПКИ (усилено очисткой слешей)
 	if len(ti.FileStats) > 0 {
 		commonRoot := ""
 		isSingleRoot := true
 		for _, f := range ti.FileStats {
-			idx := strings.Index(f.Path, "/")
+			cleanPath := strings.TrimPrefix(f.Path, "/")
+			idx := strings.Index(cleanPath, "/")
 			if idx != -1 {
-				rootFolder := f.Path[:idx+1]
+				rootFolder := cleanPath[:idx+1]
 				if commonRoot == "" {
 					commonRoot = rootFolder
 				} else if commonRoot != rootFolder {
@@ -117,10 +195,11 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 	var items []VfsItem
 
 	for _, f := range ti.FileStats {
-		if !strings.HasPrefix(f.Path, us.CurrentDir) {
+		cleanPath := strings.TrimPrefix(f.Path, "/")
+		if !strings.HasPrefix(cleanPath, us.CurrentDir) {
 			continue
 		}
-		relPath := f.Path[len(us.CurrentDir):]
+		relPath := cleanPath[len(us.CurrentDir):]
 
 		if idx := strings.Index(relPath, "/"); idx != -1 {
 			dirName := relPath[:idx]
@@ -144,12 +223,13 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 		}
 	}
 
-	// Сортируем: папки сверху, потом файлы, всё по алфавиту
+	// Сортируем: папки сверху, потом файлы; внутри группы — по "естественному"
+	// порядку (числа сравниваются как числа: 2 < 10, а не "10" < "2").
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].IsFile != items[j].IsFile {
 			return !items[i].IsFile
 		}
-		return items[i].Name < items[j].Name
+		return naturalLess(items[i].Name, items[j].Name)
 	})
 
 	totalItems := len(items)
@@ -187,9 +267,10 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 			btn := filesKbd.Data(btnText, "\ftog", ti.Hash, strconv.Itoa(item.FileID))
 			rows = append(rows, filesKbd.Row(btn))
 		} else {
-			// Хэш для пути папки (чтобы влезть в callback_data)
-			h := crc32.ChecksumIEEE([]byte(item.FullPath))
-			pathMap.Store(h, item.FullPath)
+			// Хэш для пути папки (чтобы влезть в callback_data), скопирован
+			// на пользователя и торрент — см. pathMapKey.
+			h := pathMapKey(c.Sender().ID, ti.Hash, item.FullPath)
+			pathMap.Store(h, &pathEntry{path: item.FullPath, ts: time.Now()})
 			dirHash := strconv.FormatUint(uint64(h), 10)
 
 			// Кнопка входа в папку
@@ -238,6 +319,16 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 	return c.Send(txt, filesKbd, tele.ModeHTML)
 }
 
+// Вспомогательная функция: является ли расширение файла изображением для обложки
+func isImageFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif":
+		return true
+	}
+	return false
+}
+
 func getTorrent(c tele.Context) error {
 	args := c.Args()
 	for i := range args {
@@ -250,6 +341,7 @@ func getTorrent(c tele.Context) error {
 	if !strings.HasPrefix(cmd, "\f") {
 		cmd = "\f" + cmd
 	}
+	log.Printf("[torrent] getTorrent: user=%d cmd=%s args=%v", c.Sender().ID, cmd, args[1:])
 
 	// Пустышка для индикатора страницы
 	if cmd == "\fnoop" {
@@ -288,9 +380,9 @@ func getTorrent(c tele.Context) error {
 		hash := args[1]
 		dirHash, _ := strconv.ParseUint(args[2], 10, 32)
 
-		if fullPath, ok := pathMap.Load(uint32(dirHash)); ok {
+		if entry, ok := pathMap.Load(uint32(dirHash)); ok {
 			us := getUserState(c.Sender().ID, hash)
-			us.CurrentDir = fullPath.(string)
+			us.CurrentDir = entry.(*pathEntry).path
 			us.Page = 0
 		}
 
@@ -327,7 +419,7 @@ func getTorrent(c tele.Context) error {
 		return c.Respond()
 	}
 
-	// Скачать всю текущую папку (с сортировкой)
+	// Скачать всю текущую папку (автоматически включает все картинки)
 	if cmd == "\fdall" {
 		if len(args) != 2 {
 			return errors.New("Ошибка данных")
@@ -342,12 +434,13 @@ func getTorrent(c tele.Context) error {
 
 		var files []*state.TorrentFileStat
 		for _, f := range ti.FileStats {
-			if strings.HasPrefix(f.Path, us.CurrentDir) {
+			cleanPath := strings.TrimPrefix(f.Path, "/")
+			if strings.HasPrefix(cleanPath, us.CurrentDir) {
 				files = append(files, f)
 			}
 		}
 		sort.Slice(files, func(i, j int) bool {
-			return files[i].Path < files[j].Path
+			return naturalLess(files[i].Path, files[j].Path)
 		})
 
 		count := 0
@@ -412,14 +505,14 @@ func getTorrent(c tele.Context) error {
 		hash := args[1]
 		dirHash, _ := strconv.ParseUint(args[2], 10, 32)
 
-		fullPath, ok := pathMap.Load(uint32(dirHash))
+		entry, ok := pathMap.Load(uint32(dirHash))
 		if !ok {
 			return c.Respond(&tele.CallbackResponse{
 				Text:      "Данные устарели. Откройте меню заново.",
 				ShowAlert: true,
 			})
 		}
-		path := fullPath.(string)
+		path := entry.(*pathEntry).path
 
 		// Мгновенно отвечаем, чтобы кнопка не зависала
 		c.Respond(&tele.CallbackResponse{Text: "Переключаем..."})
@@ -433,7 +526,8 @@ func getTorrent(c tele.Context) error {
 
 		newState := !isDirFullySelected(ti, us, path)
 		for _, f := range ti.FileStats {
-			if strings.HasPrefix(f.Path, path) {
+			cleanPath := strings.TrimPrefix(f.Path, "/")
+			if strings.HasPrefix(cleanPath, path) {
 				us.Selections[f.Id] = newState
 			}
 		}
@@ -441,7 +535,7 @@ func getTorrent(c tele.Context) error {
 		return nil
 	}
 
-	// Скачать выбранные файлы (с сортировкой)
+	// Скачать выбранные файлы (автоматически добавляем картинки из тех же папок, что и аудио)
 	if cmd == "\fdown" {
 		if len(args) != 2 {
 			return errors.New("Ошибка данных")
@@ -454,9 +548,32 @@ func getTorrent(c tele.Context) error {
 			return c.Respond(&tele.CallbackResponse{Text: "Ошибка получения данных", ShowAlert: true})
 		}
 
+		// Собираем множество папок, в которых есть выбранные файлы
+		selectedDirs := make(map[string]bool) // ключ – виртуальный путь к папке
 		idToPath := make(map[int]string)
 		for _, f := range ti.FileStats {
-			idToPath[f.Id] = f.Path
+			cleanPath := strings.TrimPrefix(f.Path, "/")
+			idToPath[f.Id] = cleanPath
+			if us.Selections[f.Id] {
+				dir := filepath.Dir(cleanPath)
+				if dir != "." {
+					selectedDirs[dir+"/"] = true
+				}
+			}
+		}
+
+		// Добавляем все файлы-картинки, лежащие в этих папках
+		for _, f := range ti.FileStats {
+			if !us.Selections[f.Id] && isImageFile(f.Path) {
+				cleanPath := strings.TrimPrefix(f.Path, "/")
+				dir := filepath.Dir(cleanPath)
+				if dir != "." {
+					dir += "/"
+				}
+				if selectedDirs[dir] {
+					us.Selections[f.Id] = true // помечаем как выбранное, чтобы добавить в загрузку
+				}
+			}
 		}
 
 		var selectedIDs []int
@@ -470,7 +587,7 @@ func getTorrent(c tele.Context) error {
 		}
 
 		sort.Slice(selectedIDs, func(i, j int) bool {
-			return idToPath[selectedIDs[i]] < idToPath[selectedIDs[j]]
+			return naturalLess(idToPath[selectedIDs[i]], idToPath[selectedIDs[j]])
 		})
 
 		count := 0
@@ -488,36 +605,45 @@ func getTorrent(c tele.Context) error {
 	// === ОБРАБОТЧИКИ ОБЛОЖЕК ===
 	// Выбор обложки из списка
 	if cmd == "\fcover" {
-		if len(args) != 3 {
+		if len(args) != 4 {
 			return errors.New("Ошибка данных")
 		}
 		hash := args[1]
 		idx, _ := strconv.Atoi(args[2])
-		return handleCoverSelection(c, hash, idx)
+		dirHash := args[3]
+		return handleCoverSelection(c, hash, idx, dirHash)
+	}
+
+	// Пропустить выбор обложки
+	if cmd == "\fskip" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		hash := args[1]
+		dirHash := args[2]
+		return handleCoverSkip(c, hash, dirHash)
 	}
 
 	// Загрузка своей обложки
 	if cmd == "\fcovup" {
-		// просто отвечаем, данные уже в pendingCovers
-		return c.Respond(&tele.CallbackResponse{Text: "Отправьте изображение"})
-	}
-
-	// Пропустить выбор обложки (отправить как есть)
-	if cmd == "\fskip" {
-		if len(args) != 2 {
+		if len(args) != 3 {
 			return errors.New("Ошибка данных")
 		}
 		hash := args[1]
-		return handleCoverSkip(c, hash)
+		dirHash := args[2]
+		uploadExpect.Store(c.Sender().ID, uploadInfo{Hash: hash, DirHash: dirHash})
+		return c.Respond(&tele.CallbackResponse{Text: "Отправьте изображение для обложки"})
 	}
 
+	log.Printf("[torrent] getTorrent: user=%d неизвестная команда cmd=%s", c.Sender().ID, cmd)
 	return errors.New("Неизвестная команда")
 }
 
 // Проверяет, выбраны ли все файлы внутри указанной папки
 func isDirFullySelected(ti *state.TorrentStatus, us *UserState, path string) bool {
 	for _, f := range ti.FileStats {
-		if strings.HasPrefix(f.Path, path) && !us.Selections[f.Id] {
+		cleanPath := strings.TrimPrefix(f.Path, "/")
+		if strings.HasPrefix(cleanPath, path) && !us.Selections[f.Id] {
 			return false
 		}
 	}

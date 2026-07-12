@@ -12,26 +12,82 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dhowden/tag"
+	"github.com/dustin/go-humanize"
 	tele "gopkg.in/telebot.v4"
 	"torrsru/db"
 	"torrsru/tgbot/torr/state"
 )
 
-// AudioProcessor – если задана, вызывается для каждого аудиофайла после скачивания.
-// Позволяет внешнему коду (tgbot) обработать файл (добавить теги, обложку).
-var AudioProcessor func(c tele.Context, filePath string, hash string) error
+// safePartSize — порог, после которого файл считается "большим" и
+// отправляется через LargeFileProcessor (нарезка на тома 7-Zip).
+const safePartSize = 1_900_000_000
+
+var (
+	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string) error
+	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool) error
+
+	// Хуки учёта задач по временной папке торрента (реализация — в
+	// tgbot/audio.go, привязка — в tgbot/bot.go). Схема:
+	//   RegisterAudioTasks(tmpDir, 1) — в начале loading: "задача-страж",
+	//     не даёт удалить папку, пока идёт цикл выгрузки (в т.ч. фото,
+	//     документы и прочие неаудио-файлы).
+	//   AddAudioTask(tmpDir) — перед каждой передачей файла в AudioProcessor.
+	//   CompleteAudioTask(tmpDir) — в конце loading закрывает стража.
+	// Папка удаляется, когда счётчик доходит до нуля: цикл завершён И все
+	// интерактивные аудиозадачи (выбор обложки) обработаны.
+	RegisterAudioTasks func(tmpDir string, count int)
+	AddAudioTask       func(tmpDir string)
+	CompleteAudioTask  func(tmpDir string)
+)
 
 type Worker struct {
 	id          int
 	c           tele.Context
 	msg         *tele.Message
 	torrentHash string
-	isCancelled bool
+	isCancelled atomic.Bool
 	fileIndices []int
 	ti          *state.TorrentStatus
+	cachedFiles map[int]string
+	tmpDir      string
+
+	// totalBytes — суммарный размер всех файлов задачи, посчитан один раз
+	// при формировании fileIndices (AddRange) и неизменен с момента, когда
+	// задача покидает очередь и переходит в loading(). Используется для
+	// отображения СОВОКУПНОГО прогресса по всей задаче, а не только по
+	// одному текущему файлу.
+	totalBytes int64
+	// downloadedBytes/uploadedBytes — накопленный прогресс по уже
+	// полностью обработанным файлам. Текущий (ещё не завершённый) файл
+	// добавляет к этой сумме свой live-прогресс отдельно (см.
+	// updateDownloadStatus) — скачивание идёт строго последовательно, а
+	// выгрузка теперь конкурентна (см. uploadAllFiles), поэтому
+	// uploadedBytes обновляется атомарно по мере завершения каждого файла.
+	downloadedBytes atomic.Int64
+	uploadedBytes   atomic.Int64
+
+	// statusMu защищает lastStatusUpdate от гонок — выгрузка файлов теперь
+	// идёт параллельно (uploadConcurrency горутин), и без мьютекса
+	// троттлинг статус-сообщения был бы гонкой данных.
+	statusMu         sync.Mutex
+	lastStatusUpdate time.Time
+}
+
+// throttleStatusUpdate возвращает true не чаще, чем раз в minInterval —
+// используется, чтобы не заваливать Telegram Edit-запросами при частых
+// обновлениях прогресса (в т.ч. из нескольких горутин параллельной выгрузки).
+func (wrk *Worker) throttleStatusUpdate(minInterval time.Duration) bool {
+	wrk.statusMu.Lock()
+	defer wrk.statusMu.Unlock()
+	if time.Since(wrk.lastStatusUpdate) < minInterval {
+		return false
+	}
+	wrk.lastStatusUpdate = time.Now()
+	return true
 }
 
 type Manager struct {
@@ -48,10 +104,12 @@ func (m *Manager) Start() {
 }
 
 func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
+	log.Printf("[manager] AddRange: user=%d hash=%s from=%d to=%d", c.Sender().ID, hash, from, to)
 	m.queueLock.Lock()
 	defer m.queueLock.Unlock()
 
 	if len(m.queue) > 50 {
+		log.Printf("[manager] AddRange: очередь переполнена (%d), отказ user=%d hash=%s", len(m.queue), c.Sender().ID, hash)
 		c.Bot().Send(c.Recipient(), "Очередь переполнена, попробуйте попозже\n\nЭлементов в очереди:"+strconv.Itoa(len(m.queue)))
 		return
 	}
@@ -92,9 +150,11 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 			}
 			if !exists {
 				existingWrk.fileIndices = append(existingWrk.fileIndices, i)
+				existingWrk.totalBytes += ti.FileStats[i].Length
 			}
 		}
 
+		log.Printf("[manager] AddRange: добавлено к существующей задаче worker=%d hash=%s, файлов теперь=%d", existingWrk.id, hash, len(existingWrk.fileIndices))
 		m.sendQueueStatusLocked()
 		return
 	}
@@ -121,8 +181,9 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 		return
 	}
 
-	ti, _ := GetTorrentInfo(hash)
+	ti, tiErr := GetTorrentInfo(hash)
 	if ti == nil {
+		log.Printf("[manager] AddRange: GetTorrentInfo(%s) FAILED: %v", hash, tiErr)
 		c.Bot().Edit(msg, "Ошибка при подключении к торренту <code>"+hash+"</code>", tele.ModeHTML)
 		return
 	}
@@ -144,8 +205,10 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 	}
 
 	var fileIndices []int
+	var totalBytes int64
 	for i := from - 1; i <= to-1; i++ {
 		fileIndices = append(fileIndices, i)
+		totalBytes += ti.FileStats[i].Length
 	}
 
 	w := &Worker{
@@ -155,31 +218,34 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 		msg:         msg,
 		ti:          ti,
 		fileIndices: fileIndices,
+		cachedFiles: make(map[int]string),
+		totalBytes:  totalBytes,
 	}
 
 	m.queue = append(m.queue, w)
+	log.Printf("[manager] AddRange: новая задача worker=%d hash=%s файлов=%d название=%s", w.id, hash, len(fileIndices), ti.Title)
 	m.sendQueueStatusLocked()
 }
 
 func (m *Manager) Cancel(id int) {
+	log.Printf("[manager] Cancel: id=%d", id)
 	m.queueLock.Lock()
 	defer m.queueLock.Unlock()
-	var rem []int
 	for i, w := range m.queue {
 		if w.id == id {
-			w.isCancelled = true
+			log.Printf("[manager] Cancel: worker=%d hash=%s отменён в очереди (позиция %d)", w.id, w.torrentHash, i+1)
+			w.isCancelled.Store(true)
 			w.c.Bot().Delete(w.msg)
-			rem = append(rem, i)
+			m.queue = append(m.queue[:i], m.queue[i+1:]...)
 			return
 		}
 	}
-	for _, i := range rem {
-		m.queue = append(m.queue[:i], m.queue[i+1:]...)
-	}
 	if wrk, ok := m.working[id]; ok {
-		wrk.isCancelled = true
+		log.Printf("[manager] Cancel: worker=%d hash=%s отменён во время обработки", wrk.id, wrk.torrentHash)
+		wrk.isCancelled.Store(true)
 		return
 	}
+	log.Printf("[manager] Cancel: id=%d не найден ни в очереди, ни в работе", id)
 }
 
 func (m *Manager) work() {
@@ -201,9 +267,12 @@ func (m *Manager) work() {
 		m.working[wrk.id] = wrk
 		m.queueLock.Unlock()
 
+		log.Printf("[manager] work: старт обработки worker=%d hash=%s файлов=%d", wrk.id, wrk.torrentHash, len(wrk.fileIndices))
 		m.sendQueueStatus()
 
+		start := time.Now()
 		loading(wrk)
+		log.Printf("[manager] work: обработка worker=%d hash=%s завершена за %v (cancelled=%v)", wrk.id, wrk.torrentHash, time.Since(start), wrk.isCancelled.Load())
 
 		m.queueLock.Lock()
 		delete(m.working, wrk.id)
@@ -213,23 +282,58 @@ func (m *Manager) work() {
 
 func (m *Manager) sendQueueStatus() {
 	m.queueLock.Lock()
-	defer m.queueLock.Unlock()
-	m.sendQueueStatusLocked()
+	snapshot := m.queueSnapshotLocked()
+	m.queueLock.Unlock()
+	sendQueueStatusSnapshot(snapshot)
 }
 
+// sendQueueStatusLocked вызывается, когда queueLock уже удержан вызывающей
+// стороной (AddRange). Снимок очереди берётся мгновенно под локом, а сами
+// сетевые вызовы Edit к Telegram уходят в отдельную горутину — иначе N
+// последовательных сетевых запросов держали бы queueLock и блокировали
+// AddRange/Cancel на время своего выполнения.
 func (m *Manager) sendQueueStatusLocked() {
+	snapshot := m.queueSnapshotLocked()
+	go sendQueueStatusSnapshot(snapshot)
+}
+
+type queueStatusItem struct {
+	c           tele.Context
+	msg         *tele.Message
+	id          int
+	position    int
+	fileCount   int
+	torrentHash string
+}
+
+func (m *Manager) queueSnapshotLocked() []queueStatusItem {
+	snapshot := make([]queueStatusItem, 0, len(m.queue))
 	for i, wrk := range m.queue {
 		if wrk.msg == nil {
 			continue
 		}
+		snapshot = append(snapshot, queueStatusItem{
+			c:           wrk.c,
+			msg:         wrk.msg,
+			id:          wrk.id,
+			position:    i + 1,
+			fileCount:   len(wrk.fileIndices),
+			torrentHash: wrk.torrentHash,
+		})
+	}
+	return snapshot
+}
+
+func sendQueueStatusSnapshot(snapshot []queueStatusItem) {
+	for _, item := range snapshot {
 		torrKbd := &tele.ReplyMarkup{}
-		torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
+		torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(item.id)))}...)
 
-		msg := "⏳ <b>Очередь</b> (позиция " + strconv.Itoa(i+1) + ")\n"
-		msg += "📦 <b>Файлов к обработке:</b> " + strconv.Itoa(len(wrk.fileIndices)) + "\n"
-		msg += "⚙️ <code>" + wrk.torrentHash + "</code>"
+		msg := "⏳ <b>Очередь</b> (позиция " + strconv.Itoa(item.position) + ")\n"
+		msg += "📦 <b>Файлов к обработке:</b> " + strconv.Itoa(item.fileCount) + "\n"
+		msg += "⚙️ <code>" + item.torrentHash + "</code>"
 
-		wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
+		item.c.Bot().Edit(item.msg, msg, torrKbd, tele.ModeHTML)
 	}
 }
 
@@ -252,108 +356,166 @@ func GetProgressBar(percent float64) string {
 }
 
 func loading(wrk *Worker) {
+	log.Printf("[manager] loading: worker=%d hash=%s: старт, файлов=%d", wrk.id, wrk.torrentHash, len(wrk.fileIndices))
+	tmpDir, err := os.MkdirTemp("", "torrdl_*")
+	if err != nil {
+		log.Printf("[manager] loading: worker=%d: не удалось создать временную папку: %v", wrk.id, err)
+		wrk.c.Bot().Edit(wrk.msg, "Ошибка создания временной папки", tele.ModeHTML)
+		return
+	}
+	wrk.tmpDir = tmpDir
+	log.Printf("[manager] loading: worker=%d: временная папка %s", wrk.id, tmpDir)
+
+	// Задача-страж: пока цикл выгрузки не завершён, временную папку
+	// удалять нельзя — из неё выгружаются в том числе неаудио-файлы
+	// (фото, документы). Закрывается через defer при любом исходе
+	// (успех, ошибка, отмена). Папка будет реально удалена, когда
+	// счётчик задач в tgbot/audio.go дойдёт до нуля.
+	hooksReady := RegisterAudioTasks != nil && AddAudioTask != nil && CompleteAudioTask != nil
+	if hooksReady {
+		RegisterAudioTasks(tmpDir, 1)
+		defer CompleteAudioTask(tmpDir)
+	} else {
+		// Хуки не привязаны (аудио-обработка отключена) — папку чистим
+		// сами по завершении.
+		defer os.RemoveAll(tmpDir)
+	}
+
 	iserr := false
 	totalFiles := len(wrk.fileIndices)
 
-	// ФАЗА 1: Скачивание
 	for idx, fileIndex := range wrk.fileIndices {
-		if wrk.isCancelled {
+		if wrk.isCancelled.Load() {
+			log.Printf("[manager] loading: worker=%d: отменено на скачивании файла %d/%d", wrk.id, idx+1, totalFiles)
 			return
 		}
 		file := wrk.ti.FileStats[fileIndex]
-
-		err := downloadFileToServer(wrk, file, idx+1, totalFiles)
+		dlStart := time.Now()
+		tmpPath, err := downloadFileToDisk(wrk, file, idx+1, totalFiles)
 		if err != nil {
+			log.Printf("[manager] loading: worker=%d: скачивание файла %q FAILED после %v: %v", wrk.id, file.Path, time.Since(dlStart), err)
 			errstr := fmt.Sprintf("Ошибка скачивания файла на сервер: %v\n\n%v", file.Path, err.Error())
 			wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
 			iserr = true
 			break
 		}
+		log.Printf("[manager] loading: worker=%d: файл %q скачан за %v -> %s", wrk.id, file.Path, time.Since(dlStart), tmpPath)
+		wrk.cachedFiles[fileIndex] = tmpPath
 	}
 
-	if iserr || wrk.isCancelled {
+	if iserr || wrk.isCancelled.Load() {
 		return
 	}
 
-	// ФАЗА 2: Выгрузка
-	for idx, fileIndex := range wrk.fileIndices {
-		if wrk.isCancelled {
-			return
-		}
-		file := wrk.ti.FileStats[fileIndex]
+	iserr = uploadAllFiles(wrk, totalFiles)
 
-		err := uploadFileToTG(wrk, file, idx+1, totalFiles)
-		if err != nil {
-			errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", file.Path, err.Error())
-			wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
-			iserr = true
-			break
-		}
-	}
-
-	if !iserr && !wrk.isCancelled {
+	if !iserr && !wrk.isCancelled.Load() {
+		log.Printf("[manager] loading: worker=%d hash=%s: успешно завершено", wrk.id, wrk.torrentHash)
 		wrk.c.Bot().Delete(wrk.msg)
 	}
 }
 
-func downloadFileToServer(wrk *Worker, file *state.TorrentFileStat, fi, fc int) error {
-	tgfid := db.GetTGFileID(wrk.torrentHash + "|" + strconv.Itoa(file.Id))
-	if tgfid != "" {
-		return nil
-	}
+// uploadConcurrency — сколько файлов выгружаются в Telegram одновременно.
+// Раньше файлы отправлялись строго по одному, хотя каждый апload — это
+// сетевой I/O (десятки секунд на трек, см. логи sendWithRetry), а сама
+// выгрузка (ffmpeg-конвертация/тегирование одного трека и сетевая отправка
+// другого) не имеет общих зависимостей между разными файлами одной задачи —
+// PendingCover/audioTaskCounts в audio.go уже защищены мьютексами/atomic
+// именно для конкурентного доступа. Значение подобрано консервативно, чтобы
+// не упереться в flood-control локального Bot API сервера.
+const uploadConcurrency = 3
 
-	torrFileDownload, err := NewTorrFile(wrk, file)
-	if err != nil {
-		return err
-	}
+// uploadAllFiles выгружает файлы задачи с ограниченной конкурентностью.
+// Возвращает true, если хотя бы одна выгрузка завершилась ошибкой (в этом
+// случае пользователю уже отправлено сообщение об ошибке).
+func uploadAllFiles(wrk *Worker, totalFiles int) bool {
+	sem := make(chan struct{}, uploadConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	var firstErrFile string
+	var completed atomic.Int32
 
-	var wa sync.WaitGroup
-	wa.Add(1)
-	complete := false
+	wrk.reportUploadProgress(totalFiles, 0)
 
-	go func() {
-		for !complete {
-			if wrk.isCancelled {
-				complete = true
-				break
+	for idx, fileIndex := range wrk.fileIndices {
+		if wrk.isCancelled.Load() {
+			log.Printf("[manager] loading: worker=%d: отменено, выгрузка файла %d/%d не запущена", wrk.id, idx+1, totalFiles)
+			break
+		}
+		mu.Lock()
+		stop := firstErr != nil
+		mu.Unlock()
+		if stop {
+			break
+		}
+
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(idx, fileIndex int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if wrk.isCancelled.Load() {
+				return
 			}
-			updateLoadStatus(wrk, torrFileDownload, fi, fc)
-			time.Sleep(1 * time.Second)
-		}
-		wa.Done()
-	}()
-
-	buf := make([]byte, 1024*1024)
-	for {
-		if wrk.isCancelled {
-			break
-		}
-		_, readErr := torrFileDownload.Read(buf)
-		if readErr != nil {
-			break
-		}
+			file := wrk.ti.FileStats[fileIndex]
+			tmpPath := wrk.cachedFiles[fileIndex]
+			upStart := time.Now()
+			err := uploadFileFromDisk(wrk, file, tmpPath)
+			if err != nil {
+				log.Printf("[manager] loading: worker=%d: выгрузка файла %q FAILED после %v: %v", wrk.id, file.Path, time.Since(upStart), err)
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					firstErrFile = file.Path
+				}
+				mu.Unlock()
+				return
+			}
+			log.Printf("[manager] loading: worker=%d: файл %q выгружен за %v", wrk.id, file.Path, time.Since(upStart))
+			// Учитываем байты файла в совокупном прогрессе ПОСЛЕ реальной
+			// отправки. Исключение — интерактивный выбор обложки в
+			// audio.go: там ProcessAudioFile может вернуться раньше, чем
+			// трек реально уйдёт пользователю (см. AddAudioTask), поэтому
+			// для таких треков прогресс-бар обгонит фактическую отправку.
+			wrk.uploadedBytes.Add(file.Length)
+			done := completed.Add(1)
+			wrk.reportUploadProgress(totalFiles, int(done))
+		}(idx, fileIndex)
 	}
+	wg.Wait()
 
-	complete = true
-	wa.Wait()
-	torrFileDownload.Close()
-
-	if wrk.isCancelled {
-		return errors.New("скачивание отменено пользователем")
+	if firstErr != nil {
+		errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", firstErrFile, firstErr.Error())
+		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
+		return true
 	}
-
-	return nil
+	return false
 }
 
-func uploadFileToTG(wrk *Worker, file *state.TorrentFileStat, fi, fc int) error {
-	if wrk.isCancelled {
-		return errors.New("выгрузка отменена пользователем")
+// reportUploadProgress обновляет статус-сообщение совокупным прогрессом
+// выгрузки по ВСЕЙ задаче (байты уже отправленных файлов / общий размер),
+// а не только по одному "текущему" файлу — при конкурентной выгрузке
+// (uploadConcurrency > 1) единственного "текущего" файла всё равно не
+// существует. Троттлится, т.к. вызывается из нескольких горутин.
+func (wrk *Worker) reportUploadProgress(totalFiles, completedFiles int) {
+	if wrk.msg == nil {
+		return
+	}
+	if !wrk.throttleStatusUpdate(3 * time.Second) {
+		return
 	}
 
-	caption := filepath.Base(file.Path)
-	tgfid := db.GetTGFileID(wrk.torrentHash + "|" + strconv.Itoa(file.Id))
-
-	percent := float64(fi-1) / float64(fc) * 100.0
+	uploaded := wrk.uploadedBytes.Load()
+	totalBytes := wrk.totalBytes
+	percent := 0.0
+	if totalBytes > 0 {
+		percent = float64(uploaded) / float64(totalBytes) * 100.0
+	}
+	if percent > 100.0 {
+		percent = 100.0
+	}
 
 	ti, _ := GetTorrentInfo(wrk.torrentHash)
 	title := wrk.torrentHash
@@ -363,106 +525,215 @@ func uploadFileToTG(wrk *Worker, file *state.TorrentFileStat, fi, fc int) error 
 
 	msg := "🚀 <b>Обработка торрента...</b>\n\n"
 	msg += "💿 <b>Название:</b> " + title + "\n"
-	if fc > 1 {
-		msg += "📦 <b>Файлы:</b> " + strconv.Itoa(fi) + " из " + strconv.Itoa(fc) + "\n\n"
+	if totalFiles > 1 {
+		msg += "📦 <b>Файлы:</b> " + strconv.Itoa(completedFiles) + " из " + strconv.Itoa(totalFiles) + "\n\n"
 	} else {
 		msg += "\n"
 	}
-
 	msg += "📥 <b>Скачивание на сервер:</b>\n"
 	msg += fmt.Sprintf("Прогресс: [%s] 100.00%%\n", GetProgressBar(100.0))
 	msg += "✅ <i>Успешно завершено</i>\n\n"
-
 	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
 	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(percent), percent)
-	msg += fmt.Sprintf("🎵 Отправляется: <i>%s</i>\n\n", caption)
-
+	msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(uploaded)), humanize.Bytes(uint64(totalBytes)))
 	msg += "⚙️ <code>" + wrk.torrentHash + "</code>"
 
-	// Добавляем кнопку отмены для процесса выгрузки
 	torrKbd := &tele.ReplyMarkup{}
 	torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
 	wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
+}
 
-	torrFileUpload, err := NewTorrFile(wrk, file)
+func isImageExt(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif",
+		".tif", ".tiff", ".jfif", ".heic", ".heif", ".avif":
+		return true
+	}
+	return false
+}
+
+func downloadFileToDisk(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (string, error) {
+	tgfid := ""
+	if !isImageExt(file.Path) {
+		tgfid = db.GetTGFileID(wrk.torrentHash + "|" + strconv.Itoa(file.Id))
+	}
+	if tgfid != "" {
+		log.Printf("[manager] downloadFileToDisk: %q уже есть в кэше Telegram (fileID), скачивание пропущено", file.Path)
+		wrk.downloadedBytes.Add(file.Length)
+		return "", nil
+	}
+
+	torrFile, err := NewTorrFile(wrk, file)
+	if err != nil {
+		log.Printf("[manager] downloadFileToDisk: не удалось открыть поток %q: %v", file.Path, err)
+		return "", err
+	}
+	defer torrFile.Close()
+
+	relPath := file.Path
+	if strings.HasPrefix(relPath, "/") {
+		relPath = relPath[1:]
+	}
+	fullPath := filepath.Join(wrk.tmpDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return "", err
+	}
+
+	tmpFile, err := os.Create(fullPath)
+	if err != nil {
+		return "", err
+	}
+	defer tmpFile.Close()
+
+	var wa sync.WaitGroup
+	wa.Add(1)
+	var complete atomic.Bool
+
+	go func() {
+		for !complete.Load() {
+			if wrk.isCancelled.Load() {
+				complete.Store(true)
+				break
+			}
+			updateDownloadStatus(wrk, torrFile, fi, fc)
+			time.Sleep(1 * time.Second)
+		}
+		wa.Done()
+	}()
+
+	_, copyErr := io.Copy(tmpFile, torrFile)
+	complete.Store(true)
+	wa.Wait()
+
+	if wrk.isCancelled.Load() {
+		return "", errors.New("скачивание отменено пользователем")
+	}
+	if copyErr != nil {
+		return "", copyErr
+	}
+
+	wrk.downloadedBytes.Add(file.Length)
+	return fullPath, nil
+}
+
+// isProcessableAudio — форматы, которые обрабатывает интерактивный
+// AudioProcessor (теги + обложки). ВАЖНО: список должен совпадать с
+// проверкой расширений в tgbot/audio.go ProcessAudioFile. Форматы вроде
+// .wav/.aac считаются аудио (isAudioExt), но идут обычным путём отправки —
+// раньше они попадали в AudioProcessor, который их молча игнорировал,
+// и такие файлы вообще не отправлялись пользователю.
+func isProcessableAudio(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp3", ".flac", ".m4a", ".ogg":
+		return true
+	}
+	return false
+}
+
+func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath string) error {
+	if wrk.isCancelled.Load() {
+		return errors.New("выгрузка отменена пользователем")
+	}
+	if diskPath == "" {
+		// downloadFileToDisk отдаёт "" только тогда, когда файл уже был
+		// отправлен раньше и его FileID закэширован (см. db.GetTGFileID
+		// там же) — раньше этот случай молча игнорировался и закэшированный
+		// файл вообще не доходил до пользователя повторно.
+		if !isImageExt(file.Path) {
+			if tgfid := db.GetTGFileID(wrk.torrentHash + "|" + strconv.Itoa(file.Id)); tgfid != "" {
+				return sendCachedFile(wrk, file, tgfid)
+			}
+		}
+		log.Printf("[manager] uploadFileFromDisk: %q: пустой diskPath и файл не в кэше — пропуск без отправки", file.Path)
+		return nil
+	}
+
+	caption := filepath.Base(file.Path)
+
+	// Статус-сообщение здесь больше не редактируется точечно под этот один
+	// файл — при конкурентной выгрузке (см. uploadAllFiles) "текущий файл"
+	// перестал быть осмысленным понятием (одновременно грузится несколько).
+	// Совокупный прогресс по всей задаче показывает reportUploadProgress,
+	// вызываемый из uploadAllFiles до старта и после завершения каждого
+	// файла.
+	if file.Length >= safePartSize {
+		if LargeFileProcessor != nil {
+			return LargeFileProcessor(wrk.c, diskPath, file.Length, file.Path, wrk.torrentHash, wrk.msg, wrk.isCancelled.Load)
+		} else {
+			return errors.New("файл превышает 1.9 ГБ, разбиение не настроено")
+		}
+	}
+
+	isAudio := isAudioExt(file.Path)
+
+	if isAudio && AudioProcessor != nil && isProcessableAudio(file.Path) {
+		// Регистрируем интерактивную аудиозадачу ДО вызова обработчика:
+		// её закроет tgbot/audio.go, когда трек будет реально отправлен
+		// (в т.ч. после того как пользователь выберет обложку).
+		if AddAudioTask != nil {
+			AddAudioTask(wrk.tmpDir)
+		}
+		return AudioProcessor(wrk.c, diskPath, wrk.torrentHash, wrk.tmpDir)
+	}
+
+	fileReader, err := os.Open(diskPath)
 	if err != nil {
 		return err
 	}
-	defer torrFileUpload.Close()
-
-	ext := strings.ToLower(filepath.Ext(file.Path))
-	isAudio := ext == ".mp3" || ext == ".flac" || ext == ".m4a" || ext == ".wav" || ext == ".ogg" || ext == ".aac"
-
-	// Если это аудио и задан AudioProcessor – сохраняем во временный файл и делегируем обработку
-	if isAudio && AudioProcessor != nil {
-		tmpFile, err := os.CreateTemp("", "torraudio_*"+ext)
-		if err != nil {
-			return err
-		}
-		tmpPath := tmpFile.Name()
-		defer os.Remove(tmpPath)
-
-		_, err = io.Copy(tmpFile, torrFileUpload)
-		torrFileUpload.Close()
-		tmpFile.Close()
-		if err != nil {
-			return err
-		}
-		// Передаём управление внешнему обработчику (tgbot.ProcessAudioFile)
-		return AudioProcessor(wrk.c, tmpPath, wrk.torrentHash)
-	}
+	defer fileReader.Close()
 
 	var sendable interface{}
-
 	if isAudio {
 		audio := &tele.Audio{
 			FileName: file.Path,
 			Caption:  caption,
 		}
-
-		if tgfid != "" {
-			audio.FileID = tgfid
-		} else {
-			if rs, ok := interface{}(torrFileUpload).(io.ReadSeeker); ok {
-				if m, err := tag.ReadFrom(rs); err == nil {
-					if m.Title() != "" {
-						audio.Title = m.Title()
-					}
-					if m.Artist() != "" {
-						audio.Performer = m.Artist()
-					}
-					if pic := m.Picture(); pic != nil {
-						audio.Thumbnail = &tele.Photo{File: tele.FromReader(bytes.NewReader(pic.Data))}
-					}
-				}
-				rs.Seek(0, io.SeekStart)
+		if m, err := tag.ReadFrom(fileReader); err == nil {
+			if m.Title() != "" {
+				audio.Title = m.Title()
 			}
-			audio.File.FileReader = torrFileUpload
+			if m.Artist() != "" {
+				audio.Performer = m.Artist()
+			}
+			if pic := m.Picture(); pic != nil {
+				audio.Thumbnail = &tele.Photo{File: tele.FromReader(bytes.NewReader(pic.Data))}
+			}
 		}
+		fileReader.Seek(0, io.SeekStart)
+		audio.File = tele.FromReader(fileReader)
 		sendable = audio
 	} else {
-		d := &tele.Document{
+		// Фото и остальные файлы отправляются как документы (без
+		// пережатия). Раньше картинки здесь пропускались (return nil)
+		// и вообще не доходили до пользователя.
+		doc := &tele.Document{
 			FileName: file.Path,
 			Caption:  caption,
+			File:     tele.FromReader(fileReader),
 		}
-		if tgfid != "" {
-			d.FileID = tgfid
-		} else {
-			d.File.FileReader = torrFileUpload
-		}
-		sendable = d
+		sendable = doc
 	}
 
+	return sendWithRetry(wrk, file, sendable)
+}
+
+// sendWithRetry отправляет sendable (*tele.Audio или *tele.Document) с
+// повторными попытками при сетевых ошибках и сохраняет полученный от
+// Telegram FileID в кэше, чтобы повторные запросы того же файла отдавались
+// без повторного скачивания/выгрузки.
+func sendWithRetry(wrk *Worker, file *state.TorrentFileStat, sendable interface{}) error {
 	var sendErr error
 	for i := 0; i < 20; i++ {
-		if wrk.isCancelled {
+		if wrk.isCancelled.Load() {
 			return errors.New("выгрузка отменена пользователем")
 		}
 		sendErr = wrk.c.Send(sendable)
 		if sendErr == nil || errors.Is(sendErr, ERR_STOPPED) {
 			break
 		} else {
-			log.Println("Error send msg, try again:", i+1, "/", 20)
+			log.Printf("[manager] sendWithRetry: %q попытка %d/20 FAILED: %v", file.Path, i+1, sendErr)
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -470,22 +741,109 @@ func uploadFileToTG(wrk *Worker, file *state.TorrentFileStat, fi, fc int) error 
 	if errors.Is(sendErr, ERR_STOPPED) {
 		sendErr = nil
 	} else if sendErr != nil {
-		log.Println("Error send message:", sendErr)
+		log.Printf("[manager] sendWithRetry: %q окончательно FAILED: %v", file.Path, sendErr)
 	} else {
-		var savedFileID string
-		if isAudio {
-			if a, ok := sendable.(*tele.Audio); ok {
-				savedFileID = a.FileID
-			}
-		} else {
-			if d, ok := sendable.(*tele.Document); ok {
-				savedFileID = d.FileID
-			}
-		}
-		if savedFileID != "" {
-			db.SaveTGFileID(wrk.torrentHash+"|"+strconv.Itoa(file.Id), savedFileID)
+		if a, ok := sendable.(*tele.Audio); ok && a.FileID != "" {
+			db.SaveTGFileID(wrk.torrentHash+"|"+strconv.Itoa(file.Id), a.FileID)
+		} else if d, ok := sendable.(*tele.Document); ok && d.FileID != "" {
+			db.SaveTGFileID(wrk.torrentHash+"|"+strconv.Itoa(file.Id), d.FileID)
 		}
 	}
 
 	return sendErr
+}
+
+// sendCachedFile отправляет файл, для которого уже известен Telegram FileID
+// (сохранённый sendWithRetry при прошлой отправке того же файла из другого
+// торрента/запроса) — без повторного скачивания и выгрузки байтов.
+func sendCachedFile(wrk *Worker, file *state.TorrentFileStat, tgfid string) error {
+	log.Printf("[manager] sendCachedFile: %q отправляется из кэша Telegram (fileID)", file.Path)
+	caption := filepath.Base(file.Path)
+	var sendable interface{}
+	if isAudioExt(file.Path) {
+		sendable = &tele.Audio{File: tele.File{FileID: tgfid}, FileName: file.Path, Caption: caption}
+	} else {
+		sendable = &tele.Document{File: tele.File{FileID: tgfid}, FileName: file.Path, Caption: caption}
+	}
+	return sendWithRetry(wrk, file, sendable)
+}
+
+func isAudioExt(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac":
+		return true
+	}
+	return false
+}
+
+func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int) {
+	if wrk.msg == nil {
+		return
+	}
+	if !wrk.throttleStatusUpdate(5 * time.Second) {
+		return
+	}
+
+	ti, err := GetTorrentInfo(wrk.torrentHash)
+	if err != nil {
+		return
+	}
+	if wrk.isCancelled.Load() {
+		return
+	}
+
+	if ti.DownloadSpeed == 0 {
+		ti.DownloadSpeed = 1.0
+	}
+
+	wait := time.Duration(float64(file.Loaded())/ti.DownloadSpeed) * time.Second
+	speed := humanize.Bytes(uint64(ti.DownloadSpeed)) + "/sec"
+	peers := fmt.Sprintf("%v (%v/%v)", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
+
+	// Совокупный прогресс по ВСЕЙ задаче: байты уже полностью скачанных
+	// файлов + live-прогресс текущего файла. Раньше здесь показывался
+	// только процент/размер текущего файла — при закачке альбома из 10
+	// треков пользователь не видел общий прогресс по всем 10 сразу.
+	totalBytes := wrk.totalBytes
+	downloadedNow := wrk.downloadedBytes.Load() + file.offset
+	globalPercent := 0.0
+	if totalBytes > 0 {
+		globalPercent = float64(downloadedNow) / float64(totalBytes) * 100.0
+	}
+	if globalPercent > 100.0 {
+		globalPercent = 100.0
+	}
+
+	downloadedStr := humanize.Bytes(uint64(downloadedNow))
+	totalStr := humanize.Bytes(uint64(totalBytes))
+
+	msg := "🚀 <b>Обработка торрента...</b>\n\n"
+	msg += "💿 <b>Название:</b> " + ti.Title + "\n"
+	if fc > 1 {
+		msg += "📦 <b>Файлы:</b> " + strconv.Itoa(fi) + " из " + strconv.Itoa(fc) + "\n\n"
+	} else {
+		msg += "\n"
+	}
+
+	msg += "📥 <b>Скачивание на сервер:</b>\n"
+	if file.offset < file.size {
+		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
+		msg += fmt.Sprintf("Данные: %s / %s\n", downloadedStr, totalStr)
+		msg += fmt.Sprintf("Скорость: %s | Пиры: %s\n", speed, peers)
+		msg += fmt.Sprintf("Осталось: %s\n\n", wait.String())
+	} else {
+		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
+		msg += "⏳ <i>Финализация файла...</i>\n\n"
+	}
+
+	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
+	msg += fmt.Sprintf("Прогресс: [%s] 0.00%%\n", GetProgressBar(0.0))
+	msg += "⏳ <i>Ожидание скачивания файлов...</i>\n\n"
+
+	msg += "⚙️ <code>" + file.hash + "</code>"
+
+	torrKbd := &tele.ReplyMarkup{}
+	torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
+	wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
 }

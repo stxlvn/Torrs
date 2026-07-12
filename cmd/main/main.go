@@ -18,6 +18,7 @@ func main() {
 		TMDBProxy    bool   `default:"false" arg:"--tmdb" help:"proxy for TMDB"`
 		TGBotToken   string `arg:"--token" help:"telegram bot token"`
 		TGHost       string `default:"http://127.0.0.1:8082" arg:"--tgapi" help:"local telegram api host"`
+		TGFilesDir   string `default:"/tmp/telegram-bot-files" arg:"--tgfiles" help:"local telegram-bot-api file storage dir (fallback when its HTTP /file/ download is unavailable)"`
 		TSHost       string `default:"http://127.0.0.1:8090" arg:"--ts" help:"TorrServer host"`
 	}
 	arg.MustParse(&args)
@@ -34,6 +35,7 @@ func main() {
 
 	global.TMDBProxy = args.TMDBProxy
 	global.TSHost = args.TSHost
+	global.TGFilesDir = args.TGFilesDir
 
 	db.Init()
 
