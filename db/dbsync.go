@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	"torrsru/global"
 	"torrsru/models/fdb"
 )
@@ -21,6 +22,12 @@ var (
 )
 
 func StartSync() {
+	// Если FDBHOST не задан, синхронизация не требуется
+	if _, ok := os.LookupEnv("FDBHOST"); !ok {
+		log.Println("FDBHOST not set – skipping DB sync")
+		return
+	}
+
 	for !global.Stopped {
 		syncDB()
 		time.Sleep(time.Minute * 20)
@@ -41,11 +48,7 @@ func syncDB() {
 	mu.Unlock()
 	start := time.Now()
 	gcCount := 0
-	host, ok := os.LookupEnv("FDBHOST")
-	if !ok {
-		log.Println("FDBHOST environment variable not set")
-		os.Exit(1)
-	}
+	host := os.Getenv("FDBHOST")
 	for {
 		ftstr := strconv.FormatInt(filetime, 10)
 		t := time.Unix(ft2sec(filetime), 0)
@@ -58,14 +61,20 @@ func syncDB() {
 			continue
 		}
 
+		// Проверяем, что ответ не пустой
+		if resp.StatusCode != http.StatusOK || resp.ContentLength == 0 {
+			log.Printf("FDB sync: unexpected response (status %d, length %d). Skipping.\n", resp.StatusCode, resp.ContentLength)
+			resp.Body.Close()
+			break
+		}
+
 		var js *fdb.FDBRequest
 		err = json.NewDecoder(resp.Body).Decode(&js)
-		if err != nil {
-			log.Println("Error decode json:", err)
-			return
-			return
-		}
 		resp.Body.Close()
+		if err != nil {
+			log.Printf("Error decode json: %v (body might be empty or malformed)\n", err)
+			break
+		}
 
 		err = saveTorrents(js.Collections)
 		if err != nil {
@@ -118,7 +127,5 @@ func getHash(magnet string) string {
 }
 
 func ft2sec(ft int64) int64 {
-	//#define TICKS_PER_SECOND 10000000
-	//#define EPOCH_DIFFERENCE 11644473600LL
 	return ft/10000000 - 11644473600
 }
