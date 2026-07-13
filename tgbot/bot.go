@@ -13,6 +13,7 @@ import (
 
 	"github.com/anacrolix/torrent/metainfo"
 	tele "gopkg.in/telebot.v4"
+	"torrsru/tgbot/gdrive"
 	"torrsru/tgbot/torr"
 	"torrsru/tgbot/userbot"
 )
@@ -175,6 +176,39 @@ func Start(token, host string) error {
 		botUsername = b.Me.Username
 	}
 	userbot.Start(context.Background(), botUsername)
+
+	// Google Drive (см. tgbot/gdrive) — резервное зеркало скачанных файлов,
+	// независимое от Telegram. Не блокирует и не мешает работе, если не
+	// сконфигурирован (нет GDRIVE_CLIENT_ID/SECRET) или сессия ещё не
+	// авторизована (см. cmd/gdrive-login) — тогда просто логирует это, и
+	// файлы продолжают доставляться в Telegram как обычно, без бэкапа.
+	gdrive.Start(context.Background())
+	torr.DriveMirrorActive = gdrive.Ready
+	torr.MirrorToDrive = func(torrentTitle, localPath string) {
+		if !gdrive.Ready() {
+			return
+		}
+		// Открываем СИНХРОННО (быстро — просто open()), пока файл
+		// гарантированно ещё на месте: конвейер может удалить localPath
+		// сразу после выгрузки в Telegram, но уже открытый дескриптор
+		// это переживает. Саму заливку по сети уводим в фон, чтобы не
+		// блокировать конвейер надолго.
+		f, err := gdrive.OpenFile(localPath)
+		if err != nil {
+			log.Printf("[gdrive] бэкап файла %q (%s): %v", localPath, torrentTitle, err)
+			return
+		}
+		go func() {
+			release := gdrive.AcquireUploadSlot()
+			defer release()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			if err := gdrive.UploadOpenFile(ctx, f, torrentTitle); err != nil {
+				log.Printf("[gdrive] бэкап файла %q (%s) не удался: %v", localPath, torrentTitle, err)
+			}
+		}()
+	}
+
 	go b.Start()
 	return nil
 }

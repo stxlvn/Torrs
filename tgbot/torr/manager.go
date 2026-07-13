@@ -41,16 +41,44 @@ var (
 
 	// Хуки учёта задач по временной папке торрента (реализация — в
 	// tgbot/audio.go, привязка — в tgbot/bot.go). Схема:
-	//   RegisterAudioTasks(tmpDir, 1) — в начале loading: "задача-страж",
-	//     не даёт удалить папку, пока идёт цикл выгрузки (в т.ч. фото,
-	//     документы и прочие неаудио-файлы).
-	//   AddAudioTask(tmpDir) — перед каждой передачей файла в AudioProcessor.
+	//   RegisterAudioTasks(tmpDir, 1, onDone, onBytes, onProgress) — в
+	//     начале loading: "задача-страж", не даёт удалить папку, пока идёт
+	//     цикл выгрузки (в т.ч. фото, документы и прочие неаудио-файлы).
+	//     onDone вызывается РОВНО ОДИН раз, когда счётчик дойдёт до нуля —
+	//     это и есть настоящий момент "всё точно готово" (а не момент,
+	//     когда конвейер просто передал последний физический файл — для
+	//     cue-нарезаемых альбомов это лишь начало интерактивной обработки).
+	//     onBytes вызывается на КАЖДОМ закрытии задачи (см.
+	//     AddAudioTask/CompleteAudioTask) с размером соответствующего
+	//     физического файла — так wrk.uploadedBytes растёт по мере
+	//     реальной отправки, а не сразу как только файл передан
+	//     AudioProcessor'у. onProgress вызывается МНОГО раз за жизнь любой
+	//     из задач папки (сейчас — только из cue-нарезки, см.
+	//     UpdateAudioProgress) — статус-сообщение иначе висело бы
+	//     неизменным всё время нарезки (может занимать минуты).
+	//   AddAudioTask(tmpDir, bytes) — перед каждой передачей файла в
+	//     AudioProcessor; bytes — размер этого файла (file.Length).
 	//   CompleteAudioTask(tmpDir) — в конце loading закрывает стража.
 	// Папка удаляется, когда счётчик доходит до нуля: цикл завершён И все
 	// интерактивные аудиозадачи (выбор обложки) обработаны.
-	RegisterAudioTasks func(tmpDir string, count int)
-	AddAudioTask       func(tmpDir string)
+	RegisterAudioTasks func(tmpDir string, count int, onDone func(), onBytes func(int64), onProgress func(string))
+	AddAudioTask       func(tmpDir string, bytes int64)
 	CompleteAudioTask  func(tmpDir string)
+
+	// MirrorToDrive — опциональный хук резервного копирования скачанных
+	// файлов во внешнее хранилище (см. tgbot/gdrive), вызывается сразу
+	// после успешного скачивания каждого файла, ДО выгрузки в Telegram.
+	// Не должен блокировать или прерывать выгрузку в Telegram надолго и не
+	// должен паниковать/возвращать ошибку наружу — всё это обязана решать
+	// сама реализация хука (best-effort, ошибки только логируются). nil,
+	// если бэкап не сконфигурирован — тогда просто не вызывается.
+	MirrorToDrive func(torrentTitle, localPath string)
+
+	// DriveMirrorActive сообщает, включён ли и авторизован ли прямо сейчас
+	// бэкап на Google Drive — используется только для финальной сводки в
+	// чате (loading()), не влияет на сам MirrorToDrive. nil, если бэкап не
+	// сконфигурирован вовсе (тогда считаем как false).
+	DriveMirrorActive func() bool
 )
 
 type Worker struct {
@@ -61,7 +89,6 @@ type Worker struct {
 	isCancelled atomic.Bool
 	fileIndices []int
 	ti          *state.TorrentStatus
-	cachedFiles map[int]string
 	tmpDir      string
 
 	// totalBytes — суммарный размер всех файлов задачи, посчитан один раз
@@ -73,11 +100,19 @@ type Worker struct {
 	// downloadedBytes/uploadedBytes — накопленный прогресс по уже
 	// полностью обработанным файлам. Текущий (ещё не завершённый) файл
 	// добавляет к этой сумме свой live-прогресс отдельно (см.
-	// updateDownloadStatus) — скачивание идёт строго последовательно, а
-	// выгрузка теперь конкурентна (см. uploadAllFiles), поэтому
-	// uploadedBytes обновляется атомарно по мере завершения каждого файла.
+	// updateDownloadStatus) — скачивание и выгрузка теперь идут конкурентно
+	// парами "файл за файлом" (см. runPipeline), поэтому оба поля
+	// обновляются атомарно по мере завершения каждого файла.
 	downloadedBytes atomic.Int64
 	uploadedBytes   atomic.Int64
+	// completedFiles — сколько файлов задачи уже полностью выгружено;
+	// раньше жил локальной переменной внутри runAllFiles, недоступной
+	// снаружи — вынесен на Worker, чтобы onBytes-колбэк (см.
+	// RegisterAudioTasks в loading()) мог обновить статус-сообщение сразу,
+	// когда очередной аудиофайл реально доставлен пользователем (а не
+	// только тогда, когда конвейер сам завершает СЛЕДУЮЩИЙ файл — для
+	// последнего файла задачи такого следующего вызова уже не будет).
+	completedFiles atomic.Int32
 
 	// statusMu защищает lastStatusUpdate от гонок — выгрузка файлов теперь
 	// идёт параллельно (uploadConcurrency горутин), и без мьютекса
@@ -245,7 +280,6 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 		msg:         msg,
 		ti:          ti,
 		fileIndices: fileIndices,
-		cachedFiles: make(map[int]string),
 		totalBytes:  totalBytes,
 	}
 
@@ -393,145 +427,198 @@ func loading(wrk *Worker) {
 	wrk.tmpDir = tmpDir
 	log.Printf("[manager] loading: worker=%d: временная папка %s", wrk.id, tmpDir)
 
+	// pipelineFailed запоминает, завершился ли конвейер ошибкой — известно
+	// только ПОСЛЕ runAllFiles, а onDone может понадобиться сильно позже
+	// (когда закроется последняя интерактивная аудиозадача), поэтому решение
+	// "показывать ли summary" принимается внутри onDone на момент его
+	// вызова, а не на момент регистрации. atomic — onDone может выполниться
+	// на другой горутине (той, что закрыла последнюю аудио-задачу).
+	var pipelineFailed atomic.Bool
+	totalFiles := len(wrk.fileIndices)
+	onDone := func() {
+		if pipelineFailed.Load() || wrk.isCancelled.Load() {
+			return
+		}
+		log.Printf("[manager] loading: worker=%d hash=%s: успешно завершено", wrk.id, wrk.torrentHash)
+		summary := fmt.Sprintf("✅ <b>%s</b>\nОтправлено файлов: %d", wrk.ti.Title, totalFiles)
+		if DriveMirrorActive != nil && DriveMirrorActive() {
+			summary += "\n💾 Резервная копия сохранена на Google Drive"
+		}
+		// Новым сообщением, а не правкой статуса — правка означает, что
+		// сводка "готово" появляется НАД уже отправленными в чат файлами
+		// (сообщение-статус было создано раньше всех них), из-за чего
+		// выглядит так, будто её увидели раньше, чем реально дошли все
+		// файлы. Отдельное сообщение снизу подтверждает завершение уже
+		// ПОСЛЕ того, как всё оказалось в чате. Старое статус-сообщение
+		// (с устаревшим "N из M"/промежуточным прогрессом) при этом
+		// удаляется — иначе оно так и осталось бы висеть в чате навсегда
+		// с неактуальными цифрами.
+		wrk.c.Bot().Delete(wrk.msg)
+		wrk.c.Bot().Send(wrk.c.Recipient(), summary, tele.ModeHTML)
+	}
+
+	// onProgress — промежуточный статус долгих интерактивных задач (сейчас
+	// только cue-нарезка, см. UpdateAudioProgress/performCueSplitWithCover)
+	// — троттлится тем же механизмом (throttleStatusUpdate), что и обычный
+	// прогресс скачивания/выгрузки, чтобы не заваливать Bot API правками
+	// на каждый трек большого альбома.
+	onProgress := func(text string) {
+		if pipelineFailed.Load() || wrk.isCancelled.Load() {
+			return
+		}
+		if !wrk.throttleStatusUpdate(3 * time.Second) {
+			return
+		}
+		wrk.c.Bot().Edit(wrk.msg, text, tele.ModeHTML)
+	}
+
 	// Задача-страж: пока цикл выгрузки не завершён, временную папку
 	// удалять нельзя — из неё выгружаются в том числе неаудио-файлы
 	// (фото, документы). Закрывается через defer при любом исходе
-	// (успех, ошибка, отмена). Папка будет реально удалена, когда
-	// счётчик задач в tgbot/audio.go дойдёт до нуля.
+	// (успех, ошибка, отмена). Папка будет реально удалена, а onDone
+	// вызван, когда счётчик задач в tgbot/audio.go дойдёт до нуля — для
+	// cue-нарезаемых альбомов это может случиться сильно позже, чем
+	// вернётся runAllFiles ниже (нарезка и отправка треков идёт
+	// асинхронно, после того как пользователь ответит на меню).
+	// onBytes зачисляет байты уже реально доставленного (не просто
+	// переданного AudioProcessor'у) файла и ТУТ ЖЕ обновляет статус —
+	// иначе счётчик рос бы честно, но пользователь видел бы это только
+	// когда конвейер сам обработает СЛЕДУЮЩИЙ файл (а для последнего файла
+	// задачи такого следующего вызова уже не будет вовсе, и прогресс так
+	// и останется на "0.00%", несмотря на реально отправленные треки).
+	onBytes := func(n int64) {
+		wrk.uploadedBytes.Add(n)
+		if pipelineFailed.Load() || wrk.isCancelled.Load() {
+			return
+		}
+		wrk.reportUploadProgress(totalFiles, int(wrk.completedFiles.Load()))
+	}
+
 	hooksReady := RegisterAudioTasks != nil && AddAudioTask != nil && CompleteAudioTask != nil
 	if hooksReady {
-		RegisterAudioTasks(tmpDir, 1)
+		RegisterAudioTasks(tmpDir, 1, onDone, onBytes, onProgress)
 		defer CompleteAudioTask(tmpDir)
 	} else {
 		// Хуки не привязаны (аудио-обработка отключена) — папку чистим
-		// сами по завершении.
-		defer os.RemoveAll(tmpDir)
+		// сами по завершении, но onDone всё равно должен сработать здесь же
+		// (иначе для отключённой аудио-обработки completion-сообщение
+		// пропадёт насовсем).
+		defer func() {
+			os.RemoveAll(tmpDir)
+			onDone()
+		}()
 	}
 
 	if AudioProcessor != nil {
 		prefetchCueSheets(wrk)
+		prefetchFolderImages(wrk)
 	}
 
-	iserr := false
-	totalFiles := len(wrk.fileIndices)
-
-	for idx, fileIndex := range wrk.fileIndices {
-		if wrk.isCancelled.Load() {
-			log.Printf("[manager] loading: worker=%d: отменено на скачивании файла %d/%d", wrk.id, idx+1, totalFiles)
-			return
-		}
-		file := wrk.ti.FileStats[fileIndex]
-		dlStart := time.Now()
-		tmpPath, err := downloadFileToDisk(wrk, file, idx+1, totalFiles)
-		if err != nil {
-			log.Printf("[manager] loading: worker=%d: скачивание файла %q FAILED после %v: %v", wrk.id, file.Path, time.Since(dlStart), err)
-			errstr := fmt.Sprintf("Ошибка скачивания файла на сервер: %v\n\n%v", file.Path, err.Error())
-			wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
-			iserr = true
-			break
-		}
-		log.Printf("[manager] loading: worker=%d: файл %q скачан за %v -> %s", wrk.id, file.Path, time.Since(dlStart), tmpPath)
-		wrk.cachedFiles[fileIndex] = tmpPath
-	}
-
-	if iserr || wrk.isCancelled.Load() {
-		return
-	}
-
-	iserr = uploadAllFiles(wrk, totalFiles)
-
-	if !iserr && !wrk.isCancelled.Load() {
-		log.Printf("[manager] loading: worker=%d hash=%s: успешно завершено", wrk.id, wrk.torrentHash)
-		wrk.c.Bot().Delete(wrk.msg)
+	iserr := runAllFiles(wrk, totalFiles)
+	if iserr {
+		pipelineFailed.Store(true)
 	}
 }
 
-// uploadConcurrency — сколько файлов выгружаются в Telegram одновременно.
-// Раньше файлы отправлялись строго по одному, хотя каждый апload — это
-// сетевой I/O (десятки секунд на трек, см. логи sendWithRetry), а сама
-// выгрузка (ffmpeg-конвертация/тегирование одного трека и сетевая отправка
-// другого) не имеет общих зависимостей между разными файлами одной задачи —
-// PendingCover/audioTaskCounts в audio.go уже защищены мьютексами/atomic
-// именно для конкурентного доступа. Значение подобрано консервативно, чтобы
-// не упереться в flood-control локального Bot API сервера.
-const uploadConcurrency = 3
+// pipelineConcurrency — сколько файлов ОДНОВРЕМЕННО выгружаются в Telegram
+// (см. runPipeline). Раньше файлы сначала скачивались ВСЕ, потом
+// выгружались все — раздача вроде игры (сотни ГБ суммарно) должна была
+// целиком поместиться на диск сервера разом; теперь скачивание идёт своим
+// чередом (см. ниже, почему — строго последовательно) и передаёт готовые
+// файлы выгрузке через канал, так что пиковое место на диске — это
+// примерно pipelineConcurrency файлов (буфер канала), а не вся раздача.
+// Значение то же, что было у прежней uploadConcurrency — подобрано
+// консервативно, чтобы не упереться в flood-control локального Bot API
+// сервера.
+const pipelineConcurrency = 3
 
-// uploadAllFiles выгружает файлы задачи с ограниченной конкурентностью.
-// Изображения (обложки и т.п.) выгружаются ПЕРВОЙ, полностью завершённой
-// фазой — и только потом всё остальное (аудио, документы). При
-// uploadConcurrency > 1 порядок ЗАВЕРШЕНИЯ (а значит и порядок появления
-// сообщений в чате) не совпадает с порядком запуска, поэтому простой
-// сортировки wrk.fileIndices недостаточно — нужна отдельная, дождавшаяся
-// себя фаза, чтобы обложка гарантированно пришла в чат раньше треков.
-// Возвращает true, если хотя бы одна выгрузка завершилась ошибкой (в этом
+// runAllFiles прогоняет через конвейер (см. runPipeline) все файлы задачи
+// ОДНИМ проходом, в том же порядке, в каком они перечислены в самом
+// торренте (wrk.fileIndices) — раньше картинки (обложки и т.п.) шли
+// отдельной, полностью дождавшейся себя фазой ПЕРЕД всем остальным, чтобы
+// гарантировать, что обложка окажется на диске раньше, чем откроется меню
+// её выбора для аудио. Это гарантированно доставляло обложку в чат раньше
+// треков, но и переупорядочивало доставку (мелкие файлы вроде логов,
+// идущие в торренте позже, оказывались в чате вперемешку с аудио, а не по
+// порядку). Компромисс принят осознанно: если обложка папки в самом
+// торренте перечислена ПОСЛЕ аудиотреков этой же папки (нетипично), меню
+// выбора обложки для этой папки может показаться до того как обложка
+// скачается, и картинки не будет среди вариантов — редкий краевой случай,
+// не поломка. Удаление файлов конвейером эту гарантию не затрагивает:
+// картинки и так не удаляются поштучно (см. ownedByAudioProcessor) — они
+// живут до конца всей задачи независимо от порядка фаз.
+// Возвращает true, если хотя бы один файл завершился ошибкой (в этом
 // случае пользователю уже отправлено сообщение об ошибке).
-func uploadAllFiles(wrk *Worker, totalFiles int) bool {
-	var images, rest []int
-	for _, fi := range wrk.fileIndices {
-		if isImageExt(wrk.ti.FileStats[fi].Path) {
-			images = append(images, fi)
-		} else {
-			rest = append(rest, fi)
-		}
-	}
-
+func runAllFiles(wrk *Worker, totalFiles int) bool {
 	wrk.reportUploadProgress(totalFiles, 0)
 
-	var completed atomic.Int32
-	if firstErr, firstErrFile := uploadBatch(wrk, totalFiles, images, &completed); firstErr != nil {
-		errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", firstErrFile, firstErr.Error())
-		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
-		return true
-	}
-	if wrk.isCancelled.Load() {
-		return false
-	}
-
-	if firstErr, firstErrFile := uploadBatch(wrk, totalFiles, rest, &completed); firstErr != nil {
-		errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", firstErrFile, firstErr.Error())
+	var downloaded atomic.Int32
+	if firstErr, firstErrFile := runPipeline(wrk, totalFiles, wrk.fileIndices, &downloaded, &wrk.completedFiles); firstErr != nil {
+		errstr := fmt.Sprintf("Ошибка обработки файла: %v\n\n%v", firstErrFile, firstErr.Error())
 		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
 		return true
 	}
 	return false
 }
 
-// uploadBatch выгружает один набор file-индексов с ограниченной
-// конкурентностью (uploadConcurrency), обновляя общий на всю задачу счётчик
-// completed (переиспользуется между фазами uploadAllFiles, чтобы прогресс-бар
-// считал по всей задаче, а не обнулялся между фазой картинок и остального).
-// Останавливается на первой ошибке: новые загрузки из этого батча не
-// стартуют, но уже запущенные — доигрываются.
-func uploadBatch(wrk *Worker, totalFiles int, fileIndices []int, completed *atomic.Int32) (firstErr error, firstErrFile string) {
-	sem := make(chan struct{}, uploadConcurrency)
-	var wg sync.WaitGroup
+// downloadedFile — файл, готовый к выгрузке (уже на диске), передаётся от
+// продюсера к потребителям через канал в runPipeline.
+type downloadedFile struct {
+	fileIndex int
+	tmpPath   string
+}
+
+// runPipeline скачивает файлы задачи и выгружает их в Telegram по схеме
+// "один продюсер, несколько потребителей":
+//
+//   - Скачивание — СТРОГО ПОСЛЕДОВАТЕЛЬНО, одной горутиной. Раздача качается
+//     из общего роя одного и того же торрента: несколько одновременных
+//     скачиваний РАЗНЫХ файлов делят между собой одну и ту же пропускную
+//     способность, а не складывают её — параллелить тут нечего, скорость
+//     ограничена роем, а не нашим кодом. (Best-effort зеркалирование во
+//     внешнее хранилище — см. MirrorToDrive — тоже происходит здесь, сразу
+//     после скачивания каждого файла.)
+//   - Выгрузка в Telegram — конкурентно, до pipelineConcurrency файлов
+//     одновременно: тут параллелизм оправдан, каждый апload — независимый
+//     сетевой I/O к Bot API (см. комментарий на uploadConcurrency в старой
+//     версии этого файла).
+//
+// Буфер канала (pipelineConcurrency) даёт скачиванию уйти на несколько
+// файлов вперёд выгрузки, не тратя место на диске сверх этого — именно это
+// и ограничивает пиковое использование диска раздачей вроде игры (сотни ГБ
+// суммарно), а не вся раздача целиком, как было раньше.
+//
+// downloaded/completed — общие на всю задачу счётчики (переиспользуются
+// между фазами runAllFiles, чтобы прогресс-бар считал по всей задаче, а не
+// обнулялся между фазой картинок и остального). Останавливается на первой
+// ошибке: новые файлы не стартуют (ни на скачивание, ни на выгрузку), но
+// уже скачанные и ждущие в канале — доигрываются.
+func runPipeline(wrk *Worker, totalFiles int, fileIndices []int, downloaded, completed *atomic.Int32) (firstErr error, firstErrFile string) {
+	if len(fileIndices) == 0 {
+		return nil, ""
+	}
+
+	ch := make(chan downloadedFile, pipelineConcurrency)
 	var mu sync.Mutex
 
-	for _, fileIndex := range fileIndices {
-		if wrk.isCancelled.Load() {
-			break
-		}
-		mu.Lock()
-		stop := firstErr != nil
-		mu.Unlock()
-		if stop {
-			break
-		}
-
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(fileIndex int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
+	go func() {
+		defer close(ch)
+		for _, fileIndex := range fileIndices {
 			if wrk.isCancelled.Load() {
 				return
 			}
+			mu.Lock()
+			stop := firstErr != nil
+			mu.Unlock()
+			if stop {
+				return
+			}
+
 			file := wrk.ti.FileStats[fileIndex]
-			tmpPath := wrk.cachedFiles[fileIndex]
-			upStart := time.Now()
-			err := uploadFileFromDisk(wrk, file, tmpPath)
+			dlStart := time.Now()
+			tmpPath, err := downloadFileToDisk(wrk, file, int(downloaded.Load())+1, totalFiles)
 			if err != nil {
-				log.Printf("[manager] loading: worker=%d: выгрузка файла %q FAILED после %v: %v", wrk.id, file.Path, time.Since(upStart), err)
+				log.Printf("[manager] loading: worker=%d: скачивание файла %q FAILED после %v: %v", wrk.id, file.Path, time.Since(dlStart), err)
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -540,19 +627,131 @@ func uploadBatch(wrk *Worker, totalFiles int, fileIndices []int, completed *atom
 				mu.Unlock()
 				return
 			}
-			log.Printf("[manager] loading: worker=%d: файл %q выгружен за %v", wrk.id, file.Path, time.Since(upStart))
-			// Учитываем байты файла в совокупном прогрессе ПОСЛЕ реальной
-			// отправки. Исключение — интерактивный выбор обложки в
-			// audio.go: там ProcessAudioFile может вернуться раньше, чем
-			// трек реально уйдёт пользователю (см. AddAudioTask), поэтому
-			// для таких треков прогресс-бар обгонит фактическую отправку.
-			wrk.uploadedBytes.Add(file.Length)
-			done := completed.Add(1)
-			wrk.reportUploadProgress(totalFiles, int(done))
-		}(fileIndex)
+			downloaded.Add(1)
+			log.Printf("[manager] loading: worker=%d: файл %q скачан за %v -> %s", wrk.id, file.Path, time.Since(dlStart), tmpPath)
+
+			if MirrorToDrive != nil && tmpPath != "" {
+				MirrorToDrive(wrk.ti.Title, tmpPath)
+			}
+
+			ch <- downloadedFile{fileIndex: fileIndex, tmpPath: tmpPath}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < pipelineConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for df := range ch {
+				if wrk.isCancelled.Load() {
+					continue
+				}
+				mu.Lock()
+				stop := firstErr != nil
+				mu.Unlock()
+				if stop {
+					continue
+				}
+
+				file := wrk.ti.FileStats[df.fileIndex]
+				upStart := time.Now()
+				err := uploadFileFromDisk(wrk, file, df.tmpPath)
+				if err != nil {
+					log.Printf("[manager] loading: worker=%d: выгрузка файла %q FAILED после %v: %v", wrk.id, file.Path, time.Since(upStart), err)
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						firstErrFile = file.Path
+					}
+					mu.Unlock()
+					continue
+				}
+				log.Printf("[manager] loading: worker=%d: файл %q выгружен за %v", wrk.id, file.Path, time.Since(upStart))
+				// Учитываем байты файла в совокупном прогрессе ПОСЛЕ реальной
+				// отправки — КРОМЕ файлов, отданных в AudioProcessor
+				// (интерактивный выбор обложки, cue-нарезка): для них
+				// возврат uploadFileFromDisk означает лишь "меню показано",
+				// а не "файл действительно доставлен" — для таких файлов
+				// wrk.uploadedBytes зачтёт байты позже, через onBytes в
+				// RegisterAudioTasks (см. tgbot/audio.go), когда трек(и)
+				// реально уйдут пользователю. Условие то же, что решает
+				// ownedByAudioProcessor — только БЕЗ картинок: их обработка
+				// (в т.ч. решение пропустить отправку) уже полностью
+				// завершена к этому моменту, откладывать нечего.
+				if !(isAudioExt(file.Path) && ownedByAudioProcessor(file, df.tmpPath)) {
+					wrk.uploadedBytes.Add(file.Length)
+				}
+				done := completed.Add(1)
+				wrk.reportUploadProgress(totalFiles, int(done))
+
+				// Локальную копию можно стереть сразу — освобождает место на
+				// диске для следующих файлов конвейера — кроме файлов, за
+				// которыми ещё присматривает AudioProcessor (интерактивный
+				// выбор обложки, cue-нарезка): их жизненным циклом управляет
+				// счётчик RegisterAudioTasks/AddAudioTask/CompleteAudioTask
+				// (tgbot/audio.go), а не этот вызов. tmpPath == "" — файл уже
+				// был в кэше Telegram, на диске его и не было.
+				if df.tmpPath != "" && !ownedByAudioProcessor(file, df.tmpPath) {
+					os.Remove(df.tmpPath)
+				}
+			}
+		}()
 	}
 	wg.Wait()
 	return firstErr, firstErrFile
+}
+
+// ownedByAudioProcessor сообщает, будет ли файл (после успешной выгрузки)
+// ещё некоторое время нужен AudioProcessor'у асинхронно — тогда runPipeline
+// не должен удалять его сам. Условие ДОЛЖНО совпадать с тем, что реально
+// решает uploadFileFromDisk перед вызовом AudioProcessor — включая гейт по
+// размеру: файл >= safePartSize уходит в AudioProcessor, только если это
+// ещё и cue-кандидат (isCueSplitCandidate + hasSiblingCueFile); иначе он
+// целиком уходит в ProcessLargeFile (7z), который НЕ трогает исходный файл
+// — тогда удалять его обязан именно конвейер, как обычный файл. Раньше
+// этот гейт здесь не проверялся, из-за чего большие не-cue аудиофайлы
+// (аудиокниги, m4a/mp3 за порогом) молча не удалялись до конца всей задачи
+// — то есть именно тот риск по месту на диске, ради которого затевался
+// весь конвейер (task A), но теперь уже на аудио-файлах.
+//
+// Картинки тоже защищены от немедленного удаления, если аудио-обработка
+// вообще включена: runAllFiles теперь идёт ОДНИМ проходом в порядке
+// торрента (без отдельной "картинки первыми" фазы, см. её комментарий) —
+// картинка аудио-папки может докачаться раньше или позже самих треков в
+// зависимости от их порядка в торренте, и именно эти файлы на диске служат
+// источником обложки для меню выбора, когда в самом аудиофайле её нет (см.
+// findImagesInDir в processAudioFileNormally и offerCueCoverSelection в
+// cue.go). Раз конвейер не удаляет картинку сама сразу после её выгрузки
+// (а держит до конца задачи, см. RegisterAudioTasks/CompleteAudioTask), она
+// остаётся на диске и доступна меню независимо от момента её собственной
+// выгрузки в чат. Сами картинки маленькие — держать их до конца задачи не
+// создаёт того риска по месту на диске, ради которого затевался весь
+// конвейер — тот был именно про большие файлы.
+func ownedByAudioProcessor(file *state.TorrentFileStat, diskPath string) bool {
+	if isImageExt(file.Path) {
+		return AudioProcessor != nil
+	}
+	if strings.EqualFold(filepath.Ext(file.Path), ".cue") {
+		// .cue тоже нужен живым на диске дольше, чем длится его СОБСТВЕННАЯ
+		// выгрузка — prefetchCueSheets кладёт его туда заранее специально
+		// для offerCueSplit (tgbot/cue.go), который может дойти до него
+		// лишь сильно позже, когда докачается связанный аудиофайл (тот
+		// обычно в разы больше и качается намного дольше крошечного .cue).
+		// Раньше .cue, если пользователь выбрал его наравне с треками,
+		// уходил как обычный документ и удалялся конвейером почти сразу
+		// (за секунды) — к моменту, когда аудиофайл доходил до
+		// ProcessAudioFile, cue-sheet уже пропадал с диска, и предложение
+		// нарезать не показывалось вовсе, хотя cue был валиден.
+		return AudioProcessor != nil
+	}
+	if !isAudioExt(file.Path) || AudioProcessor == nil || !isProcessableAudio(file.Path) {
+		return false
+	}
+	if file.Length >= safePartSize {
+		return isCueSplitCandidate(file.Path) && hasSiblingCueFile(diskPath)
+	}
+	return true
 }
 
 // reportUploadProgress обновляет статус-сообщение совокупным прогрессом
@@ -591,9 +790,27 @@ func (wrk *Worker) reportUploadProgress(totalFiles, completedFiles int) {
 	} else {
 		msg += "\n"
 	}
+	// Реальный прогресс скачивания (а не захардкоженные "100%, завершено")
+	// — конвейер выгружает уже скачанные файлы, пока следующие ещё
+	// качаются, так что скачивание всей задачи в этот момент может быть
+	// ещё не завершено. wrk.downloadedBytes — тот же счётчик, что
+	// использует updateDownloadStatus.
+	downloadedNow := wrk.downloadedBytes.Load()
+	downloadPercent := 0.0
+	if totalBytes > 0 {
+		downloadPercent = float64(downloadedNow) / float64(totalBytes) * 100.0
+	}
+	if downloadPercent > 100.0 {
+		downloadPercent = 100.0
+	}
+
 	msg += "📥 <b>Скачивание на сервер:</b>\n"
-	msg += fmt.Sprintf("Прогресс: [%s] 100.00%%\n", GetProgressBar(100.0))
-	msg += "✅ <i>Успешно завершено</i>\n\n"
+	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(downloadPercent), downloadPercent)
+	if downloadPercent >= 100.0 {
+		msg += "✅ <i>Успешно завершено</i>\n\n"
+	} else {
+		msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(downloadedNow)), humanize.Bytes(uint64(totalBytes)))
+	}
 	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
 	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(percent), percent)
 	msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(uploaded)), humanize.Bytes(uint64(totalBytes)))
@@ -631,6 +848,22 @@ func downloadFileToDisk(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (s
 		log.Printf("[manager] downloadFileToDisk: %q уже есть в кэше Telegram (fileID), скачивание пропущено", file.Path)
 		wrk.downloadedBytes.Add(file.Length)
 		return "", nil
+	}
+
+	// Картинка могла быть заранее скачана prefetchFolderImages (см.
+	// prefetch_images.go) — чтобы она уже лежала на диске к моменту, когда
+	// какой-то аудиофайл её папки откроет меню выбора обложки, даже если
+	// сама картинка перечислена в торренте ПОСЛЕ аудио. Если файл уже на
+	// месте и нужного размера — не качаем повторно, просто досчитываем
+	// прогресс и отдаём путь как обычно.
+	if isImageExt(file.Path) {
+		relPath := strings.TrimPrefix(file.Path, "/")
+		fullPath := filepath.Join(wrk.tmpDir, relPath)
+		if info, statErr := os.Stat(fullPath); statErr == nil && info.Size() == file.Length {
+			log.Printf("[manager] downloadFileToDisk: %q уже скачан заранее, повторное скачивание пропущено", file.Path)
+			wrk.downloadedBytes.Add(file.Length)
+			return fullPath, nil
+		}
 	}
 
 	var lastErr error
@@ -694,13 +927,19 @@ func downloadFileToDiskOnce(wrk *Worker, file *state.TorrentFileStat, fi, fc int
 				complete.Store(true)
 				break
 			}
-			updateDownloadStatus(wrk, torrFile, fi, fc)
+			updateDownloadStatus(wrk, torrFile, fi, fc, false)
 			time.Sleep(1 * time.Second)
 		}
 		wa.Done()
 	}()
 
-	_, copyErr := io.Copy(tmpFile, torrFile)
+	// io.Copy гоняет данные через дефолтный буфер в 32 КБ — для файла в
+	// несколько ГБ по локальному loopback (TorrServer на этой же машине)
+	// это десятки тысяч пар read/write-syscall'ов на файл. Буфер побольше
+	// снижает их число и ускоряет копирование заметно дороже, чем можно
+	// было бы ожидать от "всего лишь" локальной передачи.
+	copyBuf := make([]byte, 1<<20) // 1 МБ
+	_, copyErr := io.CopyBuffer(tmpFile, torrFile, copyBuf)
 	complete.Store(true)
 	wa.Wait()
 
@@ -710,6 +949,14 @@ func downloadFileToDiskOnce(wrk *Worker, file *state.TorrentFileStat, fi, fc int
 	if copyErr != nil {
 		return "", copyErr
 	}
+
+	// Финальное принудительное обновление (мимо троттлинга): последний
+	// периодический тик мог захватить снимок за секунду ДО реального
+	// завершения копирования (например, "99.45%"), и без этого вызова
+	// пользователь так и видел бы этот чуть-чуть недокачанный процент
+	// висящим в статусе всё время, пока файл потом обрабатывается
+	// (конвертация, cue-нарезка и т.п.) — до следующего события конвейера.
+	updateDownloadStatus(wrk, torrFile, fi, fc, true)
 
 	return fullPath, nil
 }
@@ -795,8 +1042,13 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 		// её закроет tgbot/audio.go, когда трек будет реально отправлен
 		// (в т.ч. после того как пользователь выберет обложку, подтвердит
 		// нарезку по cue, либо она в итоге откатится на 7z-архивацию).
+		// file.Length передаётся вместе с задачей — так wrk.uploadedBytes
+		// зачтёт его только когда файл ДЕЙСТВИТЕЛЬНО будет доставлен (см.
+		// ownedByAudioProcessor ниже и audioTaskEntry в tgbot/audio.go), а
+		// не сразу после того, как эта функция вернёт управление (что для
+		// cue-нарезки означает только "меню показано").
 		if AddAudioTask != nil {
-			AddAudioTask(wrk.tmpDir)
+			AddAudioTask(wrk.tmpDir, file.Length)
 		}
 		oversized := file.Length >= safePartSize
 		var fallback func() error
@@ -804,6 +1056,17 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 			fallback = buildLargeFileFallback()
 		}
 		return AudioProcessor(wrk.c, diskPath, wrk.torrentHash, wrk.tmpDir, file.Id, oversized, fallback)
+	}
+
+	if isImageExt(file.Path) && AudioProcessor != nil {
+		// Картинки здесь больше не отправляются вовсе — по решению
+		// пользователя единственный показ теперь происходит как превью-
+		// документ в меню выбора обложки (см. offerCoverSelection в
+		// tgbot/audio.go), если картинка окажется кандидатом обложки
+		// какой-то аудио-папки. Файл при этом остаётся на диске
+		// (ownedByAudioProcessor не даёт конвейеру его удалить) — доступен
+		// findImagesInDir независимо от того, что здесь его не отправили.
+		return nil
 	}
 
 	fileReader, err := os.Open(diskPath)
@@ -833,9 +1096,8 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 		audio.File = tele.FromReader(fileReader)
 		sendable = audio
 	} else {
-		// Фото и остальные файлы отправляются как документы (без
-		// пережатия). Раньше картинки здесь пропускались (return nil)
-		// и вообще не доходили до пользователя.
+		// Остальные файлы (документы и т.п.) отправляются как есть, без
+		// пережатия.
 		doc := &tele.Document{
 			FileName: file.Path,
 			Caption:  caption,
@@ -934,11 +1196,11 @@ func isAudioExt(path string) bool {
 	return false
 }
 
-func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int) {
+func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 	if wrk.msg == nil {
 		return
 	}
-	if !wrk.throttleStatusUpdate(5 * time.Second) {
+	if !force && !wrk.throttleStatusUpdate(5*time.Second) {
 		return
 	}
 
@@ -994,9 +1256,27 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int) {
 		msg += "⏳ <i>Финализация файла...</i>\n\n"
 	}
 
+	// Реальный прогресс выгрузки (а не захардкоженный "0%, ожидание") —
+	// конвейер (см. runPipeline) выгружает уже скачанные файлы конкурентно
+	// со скачиванием следующих, так что к этому моменту какие-то файлы
+	// вполне могут быть уже выгружены. wrk.uploadedBytes — тот же счётчик,
+	// что использует reportUploadProgress.
+	uploadedNow := wrk.uploadedBytes.Load()
+	uploadPercent := 0.0
+	if totalBytes > 0 {
+		uploadPercent = float64(uploadedNow) / float64(totalBytes) * 100.0
+	}
+	if uploadPercent > 100.0 {
+		uploadPercent = 100.0
+	}
+
 	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
-	msg += fmt.Sprintf("Прогресс: [%s] 0.00%%\n", GetProgressBar(0.0))
-	msg += "⏳ <i>Ожидание скачивания файлов...</i>\n\n"
+	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(uploadPercent), uploadPercent)
+	if uploadedNow > 0 {
+		msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(uploadedNow)), totalStr)
+	} else {
+		msg += "⏳ <i>Ожидание скачивания файлов...</i>\n\n"
+	}
 
 	msg += "⚙️ <code>" + file.hash + "</code>"
 

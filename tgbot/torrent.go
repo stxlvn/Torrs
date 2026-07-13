@@ -455,7 +455,9 @@ func getTorrent(c tele.Context) error {
 
 		key := fmt.Sprintf("%d_%s", c.Sender().ID, hash)
 		userStates.Delete(key)
-		c.Bot().Edit(c.Message(), fmt.Sprintf("✅ Добавлено файлов в очередь из папки: %d", count))
+		// Не оставляем отдельное подтверждение — статус уже покажет wrk.msg
+		// (заводится в torr.AddRange) и обновляется по ходу загрузки.
+		c.Bot().Delete(c.Message())
 		return c.Respond(&tele.CallbackResponse{Text: "Загрузка папки началась"})
 	}
 
@@ -598,7 +600,9 @@ func getTorrent(c tele.Context) error {
 
 		key := fmt.Sprintf("%d_%s", c.Sender().ID, hash)
 		userStates.Delete(key)
-		c.Bot().Edit(c.Message(), "✅ Добавлено файлов в очередь: "+strconv.Itoa(count))
+		// Не оставляем отдельное подтверждение — статус уже покажет wrk.msg
+		// (заводится в torr.AddRange) и обновляется по ходу загрузки.
+		c.Bot().Delete(c.Message())
 		return c.Respond(&tele.CallbackResponse{Text: "Загрузка началась"})
 	}
 
@@ -648,6 +652,22 @@ func getTorrent(c tele.Context) error {
 			return errors.New("Ошибка данных")
 		}
 		return handleCueSplitDecline(c, args[1], args[2])
+	}
+
+	// Групповое меню cue с несколькими FILE-секциями (см. offerCueGroupSplit
+	// в tgbot/cue.go) — одно решение сразу на несколько физических файлов.
+	if cmd == "\fcuegsplit" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleCueGroupSplitConfirm(c, args[1], args[2])
+	}
+
+	if cmd == "\fcuegskip" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleCueGroupSplitDecline(c, args[1], args[2])
 	}
 
 	log.Printf("[torrent] getTorrent: user=%d неизвестная команда cmd=%s", c.Sender().ID, cmd)

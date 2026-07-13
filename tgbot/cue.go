@@ -264,35 +264,76 @@ func findSiblingCueFiles(audioPath string) []string {
 	return paths
 }
 
+// CueTrackMeta — метаданные ЕДИНСТВЕННОГО трека cue-секции файла, которому
+// не нужна нарезка (см. offerCueSplit, len(section.Tracks) < 2): PERFORMER/
+// TITLE из самого cue надёжнее угадывания по имени файла (см. parseFileName
+// в audio.go), когда в самом аудиофайле тегов нет — особенно для vinyl-
+// side/многодисковых релизов, где имя файла содержит служебный суффикс
+// вроде "SideA", а не реальное название трека.
+type CueTrackMeta struct {
+	Artist string
+	Title  string
+}
+
 // offerCueSplit читает и разбирает cue-файл, ищет в нём секцию для ИМЕННО
 // этого audioPath (по имени файла в FILE) и, если в ней хотя бы 2 трека,
 // спрашивает пользователя, нарезать ли. handled=true означает, что
 // вызывающий код (ProcessAudioFile) должен вернуть управление немедленно —
 // решение по этому файлу теперь асинхронное и придёт через callback
-// (handleCueSplitConfirm/handleCueSplitDecline). handled=false — cue не
-// разобрался/не описывает этот файл/содержит для него меньше 2 треков:
-// вызывающий код должен попробовать следующий .cue из папки (если есть) или
-// обработать файл как обычный одиночный трек.
-func offerCueSplit(c tele.Context, audioPath, cuePath, hash, rootTmp string, fileID int, oversized bool, fallback func() error) (handled bool, err error) {
+// (handleCueSplitConfirm/handleCueSplitDecline, либо, для cue с несколькими
+// FILE-секциями — handleCueGroupSplitConfirm/handleCueGroupSplitDecline, см.
+// offerCueGroupSplit). handled=false — cue не разобрался/не описывает этот
+// файл/содержит для него меньше 2 треков: вызывающий код должен попробовать
+// следующий .cue из папки (если есть) или обработать файл как обычный
+// одиночный трек — meta, если не nil, несёт PERFORMER/TITLE единственного
+// трека секции для этого случая (см. CueTrackMeta).
+func offerCueSplit(c tele.Context, audioPath, cuePath, hash, rootTmp string, fileID int, oversized bool, fallback func() error) (handled bool, meta *CueTrackMeta, err error) {
 	data, err := os.ReadFile(cuePath)
 	if err != nil {
 		log.Printf("[cue] %s: не удалось прочитать %s: %v", audioPath, cuePath, err)
-		return false, nil
+		return false, nil, nil
 	}
 	sheet, err := parseCueSheet(data)
 	if err != nil {
 		log.Printf("[cue] %s: не удалось разобрать %s: %v", audioPath, cuePath, err)
-		return false, nil
+		return false, nil, nil
 	}
 	section := sheet.SectionFor(audioPath)
 	if section == nil {
 		log.Printf("[cue] %s: %s не описывает этот файл (доступные FILE: %d шт.)", audioPath, cuePath, len(sheet.Files))
-		return false, nil
+		return false, nil, nil
 	}
 	if len(section.Tracks) < 2 {
 		// Один "трек" на весь файл — нарезать нечего.
 		log.Printf("[cue] %s: в %s для этого файла меньше 2 треков (%d), нарезка не нужна", audioPath, cuePath, len(section.Tracks))
-		return false, nil
+		if len(section.Tracks) == 1 {
+			tr := section.Tracks[0]
+			performer := tr.Performer
+			if performer == "" {
+				performer = sheet.Performer
+			}
+			return false, &CueTrackMeta{Artist: performer, Title: tr.Title}, nil
+		}
+		return false, nil, nil
+	}
+
+	// Сколько секций этого cue вообще годятся для нарезки (>=2 трека) —
+	// один .cue может описывать НЕСКОЛЬКО физических файлов сразу (см.
+	// CueFileSection, типичный случай — релиз "2×LP"). Если такая секция
+	// ровно одна — обычный случай, ведём себя как раньше (см. ниже). Если
+	// больше одной — нужно ОДНО общее сообщение на все файлы сразу, а не
+	// отдельный запрос на каждый (см. offerCueGroupSplit): пользователь
+	// один раз решает "резать всё" или "отправить всё как есть", даже если
+	// не все физические файлы группы ещё докачались.
+	var qualifying int
+	for i := range sheet.Files {
+		if len(sheet.Files[i].Tracks) >= 2 {
+			qualifying++
+		}
+	}
+	if qualifying > 1 {
+		handled, err := offerCueGroupSplit(c, audioPath, cuePath, sheet, hash, rootTmp, fileID, oversized, fallback)
+		return handled, nil, err
 	}
 
 	// Ключ и параметр callback'а — по КОНКРЕТНОМУ ФАЙЛУ, а не по папке: в
@@ -334,10 +375,233 @@ func offerCueSplit(c tele.Context, audioPath, cuePath, hash, rootTmp string, fil
 	if sendErr != nil {
 		log.Printf("[cue] %s: не удалось показать меню подтверждения: %v", audioPath, sendErr)
 		pendingCueSplits.Delete(key)
-		return false, nil
+		return false, nil, nil
 	}
 	pcs.PickerMsg = sentMsg
+	return true, nil, nil
+}
+
+// pendingCueGroupFile — одна физическая секция cue внутри общего группового
+// решения (см. PendingCueGroup). Arrived/DiskPath заполняются, когда ИМЕННО
+// этот физический файл реально докачается и дойдёт до offerCueGroupSplit —
+// до этого момента запись существует только по данным самого cue (текст
+// FILE-строки + список треков), без привязки к диску.
+type pendingCueGroupFile struct {
+	AudioFile string // имя файла как оно указано в FILE-строке cue
+	Tracks    []CueTrack
+
+	Arrived   bool
+	Done      bool // решение уже применено к этому файлу
+	DiskPath  string
+	FileID    int
+	Oversized bool
+	Fallback  func() error
+}
+
+// PendingCueGroup — общее решение "резать/не резать" на ВЕСЬ cue, который
+// описывает несколько физических файлов сразу (см. pendingCueGroupFile).
+// В отличие от PendingCueSplit, здесь одно решение применяется к нескольким
+// файлам, часть которых в момент показа меню может ещё не быть на диске —
+// они докачаются позже (скачивание строго последовательное, см. runPipeline
+// в tgbot/torr/manager.go) и, найдя Decided уже true, применят решение
+// сразу, без повторного вопроса (см. offerCueGroupSplit).
+type PendingCueGroup struct {
+	CuePath        string
+	Files          []*pendingCueGroupFile
+	AlbumPerformer string
+	Hash           string
+	RootTmp        string
+	PickerMsg      *tele.Message
+
+	Decided   bool
+	Confirmed bool
+
+	mu sync.Mutex
+}
+
+var pendingCueGroups sync.Map // key: chatID_hash_crc32(cuePath) -> *PendingCueGroup
+
+// offerCueGroupSplit — версия offerCueSplit для cue с несколькими FILE-
+// секциями (>=2 трека каждая): вместо отдельного вопроса на каждый
+// физический файл показывает ОДНО общее сообщение при первом же таком
+// файле, что дошёл до этой функции, и ждёт общего решения — остальные
+// файлы группы, дойдя сюда позже (или раньше, для уже прибывших),
+// подхватывают уже принятое решение автоматически.
+func offerCueGroupSplit(c tele.Context, audioPath, cuePath string, sheet *CueSheet, hash, rootTmp string, fileID int, oversized bool, fallback func() error) (handled bool, err error) {
+	groupHash := fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(cuePath)))
+	key := fmt.Sprintf("%d_%s_%s", c.Sender().ID, hash, groupHash)
+
+	newGroup := &PendingCueGroup{
+		CuePath:        cuePath,
+		AlbumPerformer: sheet.Performer,
+		Hash:           hash,
+		RootTmp:        rootTmp,
+	}
+	for i := range sheet.Files {
+		if len(sheet.Files[i].Tracks) < 2 {
+			continue
+		}
+		newGroup.Files = append(newGroup.Files, &pendingCueGroupFile{
+			AudioFile: sheet.Files[i].AudioFile,
+			Tracks:    sheet.Files[i].Tracks,
+		})
+	}
+
+	actual, loaded := pendingCueGroups.LoadOrStore(key, newGroup)
+	group := actual.(*PendingCueGroup)
+
+	base := strings.ToLower(filepath.Base(audioPath))
+	group.mu.Lock()
+	var gf *pendingCueGroupFile
+	for _, f := range group.Files {
+		if strings.ToLower(filepath.Base(f.AudioFile)) == base {
+			gf = f
+			break
+		}
+	}
+	if gf == nil {
+		group.mu.Unlock()
+		log.Printf("[cue] %s: групповой cue %s не содержит секцию для этого файла", audioPath, cuePath)
+		return false, nil
+	}
+	gf.Arrived = true
+	gf.DiskPath = audioPath
+	gf.FileID = fileID
+	gf.Oversized = oversized
+	gf.Fallback = fallback
+	decided, confirmed := group.Decided, group.Confirmed
+	group.mu.Unlock()
+
+	if decided {
+		// Решение по группе уже принято (пользователь ответил, пока этот
+		// файл ещё качался) — применяем сразу, без нового вопроса.
+		return true, applyCueGroupDecision(c, group, gf, confirmed)
+	}
+
+	if !loaded {
+		// Мы первый физический файл этой группы, что дошёл сюда —
+		// показываем ОДНО общее сообщение на весь cue.
+		if sendErr := sendCueGroupPrompt(c, group, hash, groupHash); sendErr != nil {
+			log.Printf("[cue] %s: не удалось показать групповое меню подтверждения: %v", audioPath, sendErr)
+			pendingCueGroups.Delete(key)
+			return false, nil
+		}
+	}
+	// Решение ещё не принято — файл просто числится Arrived в группе и
+	// будет обработан, когда придёт ответ (см. finishCueGroupDecision).
 	return true, nil
+}
+
+func sendCueGroupPrompt(c tele.Context, group *PendingCueGroup, hash, groupHash string) error {
+	group.mu.Lock()
+	var lines []string
+	totalTracks := 0
+	for _, f := range group.Files {
+		lines = append(lines, fmt.Sprintf("• %s — %d треков", filepath.Base(f.AudioFile), len(f.Tracks)))
+		totalTracks += len(f.Tracks)
+	}
+	group.mu.Unlock()
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		markup.Row(markup.Data(fmt.Sprintf("🎼 Нарезать всё (%d треков)", totalTracks), "\fcuegsplit", hash, groupHash)),
+		markup.Row(markup.Data("▶️ Отправить всё как есть", "\fcuegskip", hash, groupHash)),
+	)
+	msgText := fmt.Sprintf("🎼 Найден общий cue-sheet на %d файлов:\n%s\n\nНарезать всё на отдельные треки?", len(group.Files), strings.Join(lines, "\n"))
+	sentMsg, err := c.Bot().Send(c.Recipient(), msgText, markup, tele.ModeHTML)
+	if err != nil {
+		return err
+	}
+	group.mu.Lock()
+	group.PickerMsg = sentMsg
+	group.mu.Unlock()
+	return nil
+}
+
+// handleCueGroupSplitConfirm/handleCueGroupSplitDecline — пользователь
+// ответил на общее меню (см. sendCueGroupPrompt). Применяется сразу ко всем
+// физическим файлам группы, что УЖЕ докачались (Arrived) — остальные
+// подхватят решение сами, дойдя до offerCueGroupSplit позже (Decided уже
+// true к этому моменту).
+func handleCueGroupSplitConfirm(c tele.Context, hash, groupHash string) error {
+	return finishCueGroupDecision(c, hash, groupHash, true)
+}
+
+func handleCueGroupSplitDecline(c tele.Context, hash, groupHash string) error {
+	return finishCueGroupDecision(c, hash, groupHash, false)
+}
+
+func finishCueGroupDecision(c tele.Context, hash, groupHash string, confirmed bool) error {
+	key := fmt.Sprintf("%d_%s_%s", c.Sender().ID, hash, groupHash)
+	val, ok := pendingCueGroups.Load(key)
+	if !ok {
+		return c.Respond(&tele.CallbackResponse{Text: "Данные устарели"})
+	}
+	group := val.(*PendingCueGroup)
+
+	group.mu.Lock()
+	if group.Decided {
+		group.mu.Unlock()
+		return c.Respond(&tele.CallbackResponse{Text: "Уже обработано"})
+	}
+	group.Decided = true
+	group.Confirmed = confirmed
+	pickerMsg := group.PickerMsg
+	var toProcess []*pendingCueGroupFile
+	for _, f := range group.Files {
+		if f.Arrived && !f.Done {
+			f.Done = true
+			toProcess = append(toProcess, f)
+		}
+	}
+	group.mu.Unlock()
+
+	if pickerMsg != nil {
+		c.Bot().Delete(pickerMsg)
+	}
+	if confirmed {
+		c.Respond(&tele.CallbackResponse{Text: "Принято"})
+	} else {
+		c.Respond(&tele.CallbackResponse{Text: "Отправляю как есть"})
+	}
+
+	var lastErr error
+	for _, f := range toProcess {
+		if err := applyCueGroupDecision(c, group, f, confirmed); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// applyCueGroupDecision применяет уже принятое групповое решение к ОДНОМУ
+// физическому файлу — либо запускает для него обычный цикл "выбор обложки
+// → нарезка" (переиспользуя PendingCueSplit/offerCueCoverSelection, как и
+// для одиночного cue), либо отправляет его как есть (с откатом на 7z для
+// файлов, пропущенных в обход safePartSize).
+func applyCueGroupDecision(c tele.Context, group *PendingCueGroup, f *pendingCueGroupFile, confirmed bool) error {
+	if !confirmed {
+		if f.Oversized && f.Fallback != nil {
+			fbErr := f.Fallback()
+			completeAudioTask(group.RootTmp)
+			return fbErr
+		}
+		err := processAudioFileNormally(c, f.DiskPath, group.Hash, group.RootTmp, f.FileID, nil)
+		completeAudioTask(group.RootTmp)
+		return err
+	}
+
+	pcs := &PendingCueSplit{
+		AudioPath:      f.DiskPath,
+		Tracks:         f.Tracks,
+		AlbumPerformer: group.AlbumPerformer,
+		Hash:           group.Hash,
+		FileID:         f.FileID,
+		RootTmp:        group.RootTmp,
+		Oversized:      f.Oversized,
+		Fallback:       f.Fallback,
+	}
+	return offerCueCoverSelection(c, pcs)
 }
 
 func popPendingCueSplit(c tele.Context, hash, fileHash string) (*PendingCueSplit, error) {
@@ -376,70 +640,106 @@ func handleCueSplitDecline(c tele.Context, hash, fileHash string) error {
 	}
 
 	c.Respond(&tele.CallbackResponse{Text: "Отправляю как есть"})
-	return processAudioFileNormally(c, pcs.AudioPath, pcs.Hash, pcs.RootTmp, pcs.FileID)
+	return processAudioFileNormally(c, pcs.AudioPath, pcs.Hash, pcs.RootTmp, pcs.FileID, nil)
 }
 
-// handleCueSplitConfirm — пользователь подтвердил нарезку.
+// handleCueSplitConfirm — пользователь подтвердил нарезку. Сама нарезка
+// откладывается до выбора обложки (см. offerCueCoverSelection) — раньше
+// обложка для всего альбома выбиралась автоматически (cueAlbumCover) сразу
+// здесь, без участия пользователя.
 func handleCueSplitConfirm(c tele.Context, hash, fileHash string) error {
 	pcs, err := popPendingCueSplit(c, hash, fileHash)
 	if err != nil {
 		return c.Respond(&tele.CallbackResponse{Text: "Данные устарели"})
 	}
 	if pcs.PickerMsg != nil {
-		c.Bot().Edit(pcs.PickerMsg, fmt.Sprintf("🎼 Нарезаю на %d треков...", len(pcs.Tracks)), tele.ModeHTML)
-	}
-	c.Respond(&tele.CallbackResponse{Text: "Нарезаю по CUE"})
-
-	splitErr := performCueSplit(c, pcs)
-	if pcs.PickerMsg != nil {
 		c.Bot().Delete(pcs.PickerMsg)
 	}
-	completeAudioTask(pcs.RootTmp)
-	if splitErr != nil {
-		log.Printf("[cue] %s: нарезка завершилась с ошибками: %v", pcs.AudioPath, splitErr)
-	}
-	return splitErr
+	c.Respond(&tele.CallbackResponse{Text: "Выбор обложки"})
+
+	return offerCueCoverSelection(c, pcs)
 }
 
-// cueAlbumCover достаёт обложку для всех треков нарезаемого файла разом
-// (одна попытка, а не на трек): сперва пробуем вшитую в сам исходный FLAC,
-// иначе — любую картинку из папки. Как и в обычном потоке (см.
-// compressCoverBytes), результат сжимается до ≤200 КБ под превью Telegram.
-func cueAlbumCover(audioPath string) []byte {
-	_, _, _, hasCover, coverData := readAudioInfo(audioPath)
+// offerCueCoverSelection показывает меню выбора обложки для АЛЬБОМА,
+// который сейчас будет нарезан по cue (см. handleCueSplitConfirm) — то же
+// меню и те же кнопки (\fcover/\fskip/\fcovup), что и для обычных
+// одиночных треков (см. processAudioFileNormally в audio.go), включая
+// вшитую в исходный файл обложку как отдельный пункт. Разница только в
+// завершении: по выбору управление уходит в finishCueSplit (см. ниже,
+// вызывается из handleCoverSelection/handleCoverSkip/handleCustomCoverUpload
+// в audio.go через PendingCover.CueSplit), а не в применение обложки
+// поштучно к уже готовым файлам.
+func offerCueCoverSelection(c tele.Context, pcs *PendingCueSplit) error {
+	audioDir := filepath.Dir(pcs.AudioPath)
+	fileHash := fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(pcs.AudioPath)))
+	key := fmt.Sprintf("%d_%s_%s", c.Sender().ID, pcs.Hash, fileHash)
+
+	images := findImagesInDir(audioDir)
+
+	_, _, _, hasCover, coverData := readAudioInfo(pcs.AudioPath)
 	if hasCover && len(coverData) > 0 {
-		coverPath, err := saveCoverDataToTemp(coverData)
-		if err == nil {
-			defer os.Remove(coverPath)
-			if compressed, cErr := compressCoverBytes(coverPath); cErr == nil {
-				return compressed
-			}
-			return coverData
+		if embeddedPath, err := saveEmbeddedCoverOption(audioDir, coverData); err == nil {
+			images = append([]string{embeddedPath}, images...)
+		} else {
+			log.Printf("[cue] %s: не удалось сохранить вшитую обложку для меню: %v", pcs.AudioPath, err)
 		}
 	}
 
-	images := findImagesInDir(filepath.Dir(audioPath))
-	if len(images) > 0 {
-		if compressed, err := compressCoverBytes(images[0]); err == nil {
-			return compressed
-		}
+	pc := &PendingCover{
+		AudioDir: audioDir,
+		Hash:     pcs.Hash,
+		Images:   images,
+		RootTmp:  pcs.RootTmp,
+		CueSplit: pcs,
 	}
-	return nil
+	pendingCovers.Store(key, pc)
+
+	var err error
+	if len(images) > 0 {
+		err = offerCoverSelection(c, pcs.Hash, images, fileHash, audioDir)
+	} else {
+		err = requestCustomCover(c, pcs.Hash, fileHash, audioDir)
+	}
+	if err != nil {
+		log.Printf("[cue] %s: не удалось показать меню выбора обложки: %v", pcs.AudioPath, err)
+		pendingCovers.Delete(key)
+		completeAudioTask(pcs.RootTmp)
+	}
+	return err
 }
 
-// performCueSplit нарезает исходный файл на треки по секции cue-sheet и
-// отправляет каждый. Конец трека — это начало следующего (в пределах ТОЙ ЖЕ
+// finishCueSplit готовит выбранную обложку (или её отсутствие) и запускает
+// саму нарезку — вызывается из обработчиков выбора обложки в audio.go,
+// когда PendingCover.CueSplit != nil.
+func finishCueSplit(c tele.Context, pcs *PendingCueSplit, coverPath string) error {
+	var coverData []byte
+	if coverPath != "" {
+		if compressed, err := compressCoverBytes(coverPath); err == nil {
+			coverData = compressed
+		} else {
+			log.Printf("[cue] %s: не удалось подготовить обложку (%v), продолжаю без неё", pcs.AudioPath, err)
+		}
+	}
+	err := performCueSplitWithCover(c, pcs, coverData)
+	if err != nil {
+		log.Printf("[cue] %s: нарезка завершилась с ошибками: %v", pcs.AudioPath, err)
+	}
+	return err
+}
+
+// performCueSplitWithCover нарезает исходный файл на треки по секции
+// cue-sheet и отправляет каждый с уже выбранной обложкой (coverData==nil —
+// без обложки). Конец трека — это начало следующего (в пределах ТОЙ ЖЕ
 // секции/файла) или конец файла для последнего; INDEX 00 (пре-гэп) уже
 // отброшен на этапе разбора.
 //
 // Юзербот (MTProto) или Bot API выбирается ОДИН раз на весь альбом (а не
-// решается заново для каждого трека) — тайминги и решение по обложке не
-// зависят от трека, и это же убирает частичные состояния вроде "половина
-// треков ушла через юзербота, половина как FLAC-документ через Bot API",
-// если пользователь окажется непривязан именно в середине нарезки.
-func performCueSplit(c tele.Context, pcs *PendingCueSplit) error {
+// решается заново для каждого трека) — тайминги не зависят от трека, и это
+// же убирает частичные состояния вроде "половина треков ушла через
+// юзербота, половина как FLAC-документ через Bot API", если пользователь
+// окажется непривязан именно в середине нарезки.
+func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []byte) error {
 	totalDur := time.Duration(getDurationFFprobe(pcs.AudioPath)) * time.Second
-	coverData := cueAlbumCover(pcs.AudioPath)
 
 	useUserbot := userbot.Ready()
 	outExt, codec := ".m4a", "alac"
@@ -449,6 +749,11 @@ func performCueSplit(c tele.Context, pcs *PendingCueSplit) error {
 
 	var lastErr error
 	for i, tr := range pcs.Tracks {
+		// Статус-сообщение иначе висело бы неизменным всё время нарезки
+		// (может занимать минуты на большой альбом) — см. UpdateAudioProgress
+		// и audioTaskEntry.onProgress в tgbot/audio.go.
+		UpdateAudioProgress(pcs.RootTmp, fmt.Sprintf("🎼 <b>%s</b>\nНарезка по cue: трек %d из %d", filepath.Base(pcs.AudioPath), i+1, len(pcs.Tracks)))
+
 		end := totalDur
 		if i+1 < len(pcs.Tracks) {
 			end = pcs.Tracks[i+1].Start
@@ -491,18 +796,36 @@ func performCueSplit(c tele.Context, pcs *PendingCueSplit) error {
 		}
 
 		if useUserbot {
-			msgID, chatID, err := userbot.SendToRelay(context.Background(), outPath, title, performer, durSecs, coverData)
+			msgID, chatID, sendErr := userbot.SendToRelay(context.Background(), outPath, title, performer, durSecs, coverData)
 			var sent *tele.Message
-			if err == nil {
-				sent, err = c.Bot().Copy(c.Recipient(), tele.StoredMessage{MessageID: strconv.Itoa(msgID), ChatID: chatID})
+			if sendErr == nil {
+				sent, sendErr = c.Bot().Copy(c.Recipient(), tele.StoredMessage{MessageID: strconv.Itoa(msgID), ChatID: chatID})
 			}
-			if err != nil {
-				log.Printf("[cue] %s: трек %d не отправлен через userbot: %v", pcs.AudioPath, tr.Number, err)
-				lastErr = err
+			if sendErr == nil {
+				if sent != nil && sent.Audio != nil && sent.Audio.FileID != "" {
+					db.SaveTGFileID(trackCacheKey, sent.Audio.FileID)
+				}
 				continue
 			}
-			if sent != nil && sent.Audio != nil && sent.Audio.FileID != "" {
-				db.SaveTGFileID(trackCacheKey, sent.Audio.FileID)
+
+			// Юзербот/релей подвели (например, при нескольких одновременных
+			// загрузках через один и тот же MTProto-коннекшн — см. broken
+			// pipe в логах) — раньше трек тут просто пропускался и терялся
+			// молча (пользователь недосчитывался треков в альбоме). Теперь
+			// откатываемся на Bot API: перерезаем этот ЖЕ трек в M4A (Bot
+			// API не принимает произвольный FLAC для sendAudio) и шлём как
+			// обычно. FLAC-версия (outPath) не удаляется явно — уйдёт вместе
+			// со всей tmpDir задачи, как и остальные промежуточные файлы.
+			log.Printf("[cue] %s: трек %d не отправлен через userbot (%v), откатываюсь на Bot API (M4A)", pcs.AudioPath, tr.Number, sendErr)
+			m4aPath, cutErr := cutCueTrack(pcs.AudioPath, tr.Start, end, tr.Number, ".m4a", "alac")
+			if cutErr != nil {
+				log.Printf("[cue] %s: повторная нарезка трека %d в M4A для отката не удалась: %v", pcs.AudioPath, tr.Number, cutErr)
+				lastErr = sendErr
+				continue
+			}
+			if err := sendAudio(c, m4aPath, performer, title, durSecs, coverData, trackCacheKey); err != nil {
+				log.Printf("[cue] %s: трек %d не отправлен через Bot API после отката: %v", pcs.AudioPath, tr.Number, err)
+				lastErr = err
 			}
 			continue
 		}

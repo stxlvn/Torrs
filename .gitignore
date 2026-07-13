@@ -28,3 +28,5 @@ go.work
 torrs_bot
 /userbot-login
 /userbot.session*
+/gdrive-login
+/gdrive_token.json

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/unpack"
@@ -16,6 +18,25 @@ import (
 // сессия не авторизована, либо временный обрыв связи (см. runForever в
 // client.go), либо не удалось создать/загрузить релей-группу (relay.go).
 var ErrNotReady = errors.New("userbot: клиент не готов")
+
+// sendMu сериализует все загрузки через юзербота: несколько одновременных
+// закачек (например, две разные раздачи качаются параллельно) через ОДНО и
+// то же MTProto-соединение регулярно рвали друг друга ("write: broken
+// pipe", "engine forcibly closed: context canceled" — см. историю чата) —
+// похоже, конкурентная запись в один и тот же коннекшн для gotd/td не
+// поддерживается надёжно. Раз соединение всё равно одно на весь процесс,
+// параллелизм тут ничего не даёт (кроме нестабильности) — то же самое,
+// почему скачивание в manager.go идёт последовательно (общая пропускная
+// способность одного источника).
+var sendMu sync.Mutex
+
+// sendTimeout ограничивает ОДНУ загрузку — все вызывающие сейчас передают
+// context.Background() (без таймаута самостоятельно), а раз загрузки идут
+// строго последовательно (см. sendMu), зависшая без таймаута загрузка
+// держала бы мьютекс вечно и намертво вешала бы юзербота для ВСЕХ
+// последующих задач до перезапуска процесса. 15 минут — щедрый запас даже
+// для очень большого FLAC на медленном канале.
+const sendTimeout = 15 * time.Minute
 
 // SendToRelay заливает filePath в служебную релей-группу (см. relay.go) без
 // перекодирования — в отличие от Bot API (sendAudio принимает только
@@ -37,6 +58,12 @@ func SendToRelay(ctx context.Context, filePath, title, performer string, duratio
 	if !Ready() || client == nil {
 		return 0, 0, ErrNotReady
 	}
+
+	sendMu.Lock()
+	defer sendMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
 
 	api := client.API()
 	up := uploader.NewUploader(api)

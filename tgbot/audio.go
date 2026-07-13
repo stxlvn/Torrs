@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,7 +51,27 @@ type PendingCover struct {
 	Selected   string // путь к выбранной картинке-обложке (оригинал)
 	Skipped    bool
 	RootTmp    string
-	PickerMsg  *tele.Message // сообщение с кнопками — удаляется после выбора
+	// PickerMsgs — все сообщения меню выбора обложки (по одному документу-
+	// превью на картинку-кандидата + финальное сообщение с кнопками "Без
+	// обложки"/"Загрузить свою", см. offerCoverSelection) — удаляются все
+	// разом после выбора.
+	PickerMsgs []*tele.Message
+
+	// CueSplit — не nil, если это меню обложки не для обычных треков папки
+	// (AudioPaths), а для целого альбома, который сейчас нарежут по
+	// cue-sheet (см. offerCueCoverSelection в cue.go). В этом случае выбор
+	// обложки завершается вызовом finishCueSplit, а не перебором AudioPaths.
+	CueSplit *PendingCueSplit
+
+	// Consumed — true, если решение по этой папке уже обрабатывается
+	// (или обработано). Меню теперь может состоять из НЕСКОЛЬКИХ кнопок в
+	// разных сообщениях (по одной на картинку-превью) — пока последние ещё
+	// отправляются, первые уже кликабельны, и пользователь может успеть
+	// тапнуть по двум разным кнопкам подряд, думая, что предыдущий тап не
+	// засчитался. Без этой защиты второй тап повторно запускал бы
+	// finishCueSplit/доставку треков и лишний раз декрементировал бы
+	// счётчик аудио-задач (см. audioTaskCounts в этом файле).
+	Consumed bool
 
 	mu sync.Mutex // защищает поля структуры от гонок между потоком
 	// закачки (tgbot/torr/manager.go) и обработчиками колбэков Telegram
@@ -119,27 +140,122 @@ type uploadInfo struct {
 // Telegram (для них AddAudioTask просто не вызывается).
 // ---------------------------------------------------------------------
 
-var audioTaskCounts sync.Map // rootTmp string -> *int64
+// audioTaskEntry — счётчик незавершённых аудио-задач для одной временной
+// папки плюс колбэк, который нужно вызвать РОВНО ОДИН раз, когда счётчик
+// дойдёт до нуля — то есть когда действительно всё готово (а не когда
+// manager.go просто передал последний физический файл конвейеру, что для
+// cue-нарезаемых файлов означает только "меню нарезки показано"). count и
+// onDone собираются в готовый объект ДО публикации в audioTaskCounts —
+// как и раньше с голым *int64, доп. блокировка не нужна: onDone больше не
+// меняется после Store.
+//
+// pendingBytes/onBytes — та же проблема, что решает onDone, но для
+// прогресс-бара выгрузки, а не финального сообщения: manager.go раньше
+// засчитывал file.Length в wrk.uploadedBytes сразу как только
+// uploadFileFromDisk возвращался, но для файлов, отданных в
+// AudioProcessor, "возврат" означает лишь "меню показано" — реальная
+// отправка (в т.ч. всех треков cue-нарезки) происходит позже, асинхронно.
+// AddAudioTask теперь принимает bytes и кладёт его в pendingBytes (FIFO);
+// completeAudioTask, закрывая ЛЮБУЮ из задач папки, забирает ОДНО значение
+// из очереди и передаёт в onBytes. Порядок пар AddAudioTask/completeAudioTask
+// 1:1 гарантирован (см. manager.go), но какое именно значение спарится с
+// каким конкретным закрытием — не важно: нас интересует только сумма.
+// onProgress — колбэк для промежуточного статуса ДОЛГИХ интерактивных задач
+// (сейчас — только cue-нарезка, см. performCueSplitWithCover в cue.go):
+// между тем как файл докачался (100%) и тем как onDone наконец сработает,
+// может пройти несколько минут (нарезка трек за треком) — без этого статус-
+// сообщение всё это время просто висело неизменным. В отличие от onDone/
+// onBytes вызывается МНОГО раз за жизнь задачи, не только на закрытии.
+type audioTaskEntry struct {
+	count      atomic.Int64
+	onDone     func()
+	onBytes    func(int64)
+	onProgress func(string)
+
+	bytesMu      sync.Mutex
+	pendingBytes []int64
+}
+
+var audioTaskCounts sync.Map // rootTmp string -> *audioTaskEntry
+
+// audioFolderCounts считает, сколько РАЗНЫХ папок-альбомов уже встретилось
+// в рамках одной задачи (rootTmp) — используется только чтобы решить,
+// нужен ли разделитель между альбомами в дискографии (см.
+// maybeSendAlbumSeparator): для первой папки в задаче он не нужен (она и
+// так единственная на тот момент), для второй и далее — нужен. Атомарный
+// инкремент через LoadOrStore+Add — файлы из разных папок могут дойти до
+// "новой папки" одновременно (конвейер обрабатывает несколько файлов
+// параллельно).
+var audioFolderCounts sync.Map // rootTmp string -> *int64
+
+// maybeSendAlbumSeparator отправляет короткое сообщение с названием папки
+// перед началом обработки НЕ первого альбома в дискографии (несколько
+// папок-альбомов в одной раздаче) — чтобы в чате было видно, где
+// заканчивается один альбом и начинается следующий. Для первой папки в
+// задаче ничего не отправляет.
+func maybeSendAlbumSeparator(c tele.Context, rootTmp, audioDir string) {
+	if rootTmp == "" {
+		return
+	}
+	counterVal, _ := audioFolderCounts.LoadOrStore(rootTmp, new(int64))
+	n := atomic.AddInt64(counterVal.(*int64), 1)
+	if n <= 1 {
+		return
+	}
+	folderName := filepath.Base(audioDir)
+	if _, err := c.Bot().Send(c.Recipient(), "💿 <b>"+folderName+"</b>", tele.ModeHTML); err != nil {
+		log.Printf("[audio] не удалось отправить разделитель альбома %q: %v", folderName, err)
+	}
+}
 
 // RegisterAudioTasks создаёт счётчик задач для временной папки торрента.
 // Вызывается из manager.go один раз, до начала закачки, с count=1
-// (задача-страж цикла выгрузки).
-func RegisterAudioTasks(rootTmp string, count int) {
+// (задача-страж цикла выгрузки). onDone вызывается РОВНО ОДИН раз, когда
+// счётчик дойдёт до нуля — manager.go передаёт сюда показ финального
+// сообщения "✅ Отправлено...", вместо того чтобы показывать его сразу
+// после того как конвейер передал последний файл (раньше это означало
+// ложное "готово" для cue-нарезаемых альбомов, чья интерактивная обработка
+// в этот момент только начиналась).
+func RegisterAudioTasks(rootTmp string, count int, onDone func(), onBytes func(int64), onProgress func(string)) {
 	if rootTmp == "" || count <= 0 {
 		return
 	}
-	n := int64(count)
-	audioTaskCounts.Store(rootTmp, &n)
+	entry := &audioTaskEntry{onDone: onDone, onBytes: onBytes, onProgress: onProgress}
+	entry.count.Store(int64(count))
+	audioTaskCounts.Store(rootTmp, entry)
 }
 
-// AddAudioTask увеличивает счётчик задач на единицу. Вызывается из
-// manager.go непосредственно перед передачей аудиофайла в ProcessAudioFile.
-func AddAudioTask(rootTmp string) {
+// UpdateAudioProgress передаёт промежуточный статус долгой интерактивной
+// задачи (сейчас — только cue-нарезка) в статус-сообщение задачи — см.
+// audioTaskEntry.onProgress. Не делает ничего, если для этой rootTmp нет
+// зарегистрированной задачи (аудио-обработка отключена) или onProgress не
+// задан.
+func UpdateAudioProgress(rootTmp, text string) {
 	if rootTmp == "" {
 		return
 	}
 	if val, ok := audioTaskCounts.Load(rootTmp); ok {
-		atomic.AddInt64(val.(*int64), 1)
+		if onProgress := val.(*audioTaskEntry).onProgress; onProgress != nil {
+			onProgress(text)
+		}
+	}
+}
+
+// AddAudioTask увеличивает счётчик задач на единицу. Вызывается из
+// manager.go непосредственно перед передачей аудиофайла в ProcessAudioFile.
+// bytes — размер ИМЕННО этого физического файла (file.Length в
+// manager.go) — будет зачтён в wrk.uploadedBytes через onBytes, когда
+// задача закроется (см. audioTaskEntry).
+func AddAudioTask(rootTmp string, bytes int64) {
+	if rootTmp == "" {
+		return
+	}
+	if val, ok := audioTaskCounts.Load(rootTmp); ok {
+		entry := val.(*audioTaskEntry)
+		entry.count.Add(1)
+		entry.bytesMu.Lock()
+		entry.pendingBytes = append(entry.pendingBytes, bytes)
+		entry.bytesMu.Unlock()
 	}
 }
 
@@ -157,13 +273,32 @@ func completeAudioTask(rootTmp string) {
 	if !ok {
 		return
 	}
-	counter := val.(*int64)
-	remaining := atomic.AddInt64(counter, -1)
+	entry := val.(*audioTaskEntry)
+
+	// Забираем ОДНО значение из очереди pendingBytes (если есть — задача-
+	// страж, закрывающаяся без парного AddAudioTask, очередь не пополняет)
+	// и зачисляем его в прогресс выгрузки. Делаем это на КАЖДОМ закрытии
+	// задачи, а не только на последнем — каждая из них соответствует
+	// одному реально отправленному физическому файлу.
+	entry.bytesMu.Lock()
+	var credited int64
+	if len(entry.pendingBytes) > 0 {
+		credited = entry.pendingBytes[0]
+		entry.pendingBytes = entry.pendingBytes[1:]
+	}
+	onBytes := entry.onBytes
+	entry.bytesMu.Unlock()
+	if onBytes != nil && credited > 0 {
+		onBytes(credited)
+	}
+
+	remaining := entry.count.Add(-1)
 	if remaining > 0 {
 		return
 	}
 
 	audioTaskCounts.Delete(rootTmp)
+	audioFolderCounts.Delete(rootTmp)
 	os.RemoveAll(rootTmp)
 
 	var keysToDelete []interface{}
@@ -176,6 +311,10 @@ func completeAudioTask(rootTmp string) {
 	})
 	for _, k := range keysToDelete {
 		pendingCovers.Delete(k)
+	}
+
+	if entry.onDone != nil {
+		entry.onDone()
 	}
 }
 
@@ -203,11 +342,15 @@ func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp stri
 	// несколько .cue (или один общий на несколько файлов, см.
 	// CueFileSection) — перебираем все, пока какой-то не подойдёт именно
 	// этому файлу.
+	var cueMeta *CueTrackMeta
 	if ext == ".flac" {
 		for _, cuePath := range findSiblingCueFiles(filePath) {
-			handled, err := offerCueSplit(c, filePath, cuePath, hash, rootTmp, fileID, oversized, fallback)
+			handled, meta, err := offerCueSplit(c, filePath, cuePath, hash, rootTmp, fileID, oversized, fallback)
 			if handled {
 				return err
+			}
+			if meta != nil {
+				cueMeta = meta
 			}
 			// этот .cue не описывает данный файл/не разобрался — пробуем
 			// следующий, а если это был последний — обычный путь ниже.
@@ -227,7 +370,7 @@ func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp stri
 		return err
 	}
 
-	return processAudioFileNormally(c, filePath, hash, rootTmp, fileID)
+	return processAudioFileNormally(c, filePath, hash, rootTmp, fileID, cueMeta)
 }
 
 // audioCacheKey — ключ кэша Telegram file_id (db.SaveTGFileID/GetTGFileID)
@@ -241,57 +384,34 @@ func audioCacheKey(hash string, fileID int) string {
 
 // processAudioFileNormally — путь одиночного трека (без нарезки по cue):
 // конвертация FLAC->M4A, определение обложки, отправка. Вызывается как из
-// ProcessAudioFile напрямую (cue не найден), так и из
-// handleCueSplitDecline, когда пользователь отказался от нарезки.
-func processAudioFileNormally(c tele.Context, filePath string, hash string, rootTmp string, fileID int) error {
-	ext := strings.ToLower(filepath.Ext(filePath))
-
+// ProcessAudioFile напрямую (cue не найден или описывает этот файл одним
+// треком — тогда cueMeta несёт его PERFORMER/TITLE, см. CueTrackMeta), так
+// и из handleCueSplitDecline/applyCueGroupDecision, когда пользователь
+// отказался от нарезки (там cueMeta всегда nil — секция с >=2 треками не
+// сводится к одному названию).
+func processAudioFileNormally(c tele.Context, filePath string, hash string, rootTmp string, fileID int, cueMeta *CueTrackMeta) error {
 	cacheKey := audioCacheKey(hash, fileID)
 
-	// Проверяем вшитую обложку в ИСХОДНОМ файле — до конвертации,
-	// потому что convertToM4A (-vn) выбрасывает встроенную картинку.
+	// Проверяем вшитую обложку в ИСХОДНОМ файле — до конвертации, потому
+	// что convertToM4A (-vn) выбрасывает встроенную картинку. Сама
+	// конвертация, как и выбор между юзерботом (для FLAC) и Bot API,
+	// теперь откладывается до момента реальной отправки (см. deliverTrack)
+	// — раньше юзербот-путь пробовался ЗДЕСЬ, до выбора обложки, и молча
+	// забирал файл автовыбранной обложкой (cueAlbumCover) в обход всего
+	// меню ниже.
 	artist, title, duration, hasCover, coverData := readAudioInfo(filePath)
+	// cue-sheet (если есть) — более надёжный источник PERFORMER/TITLE, чем
+	// угадывание по имени файла внутри readAudioInfo: используем его, только
+	// если самого тега в файле не было (embedded-тег имеет приоритет).
+	if cueMeta != nil {
+		if artist == "" && cueMeta.Artist != "" {
+			artist = cueMeta.Artist
+		}
+		if title == "" && cueMeta.Title != "" {
+			title = cueMeta.Title
+		}
+	}
 	log.Printf("[audio] %s: artist=%q title=%q duration=%v hasCover=%v coverBytes=%d", filePath, artist, title, duration, hasCover, len(coverData))
-
-	// Юзербот (MTProto, см. tgbot/userbot) отправляет ОРИГИНАЛЬНЫЙ FLAC без
-	// перекодирования — Bot API для sendAudio принимает только .mp3/.m4a,
-	// поэтому этот путь пробуем ДО convertToM4A. Если юзербот недоступен
-	// (не поднят) или пользователь ещё не писал ему первым (обязательное
-	// условие Telegram — юзербот не может написать первым), молча
-	// откатываемся на прежний путь ниже.
-	if ext == ".flac" && trySendFlacViaUserbot(c, filePath, artist, title, duration, cacheKey) {
-		completeAudioTask(rootTmp)
-		return nil
-	}
-
-	converted := false
-	if ext == ".flac" {
-		log.Printf("[audio] %s: конвертация FLAC -> M4A начата", filePath)
-		m4aPath, err := convertToM4A(filePath)
-		if err != nil {
-			log.Printf("[audio] %s: конвертация FLAC -> M4A не удалась: %v, отправляем как FLAC", filePath, err)
-		} else {
-			log.Printf("[audio] %s: конвертация FLAC -> M4A успешна -> %s", filePath, m4aPath)
-			// Не удаляем m4aPath через defer — отправка может произойти
-			// асинхронно (после выбора обложки); файл лежит внутри rootTmp
-			// и будет удалён вместе с папкой через completeAudioTask.
-			filePath = m4aPath
-			converted = true
-		}
-	}
-
-	// Если обложка уже вшита в файл — меню выбора не показываем:
-	// отправляем сразу. Для сконвертированного FLAC вшиваем её обратно
-	// (конвертация её удалила), для остальных — только готовим превью.
-	if hasCover && len(coverData) > 0 {
-		log.Printf("[audio] %s: обложка уже вшита, отправляем без выбора (converted=%v)", filePath, converted)
-		err := sendWithEmbeddedCover(c, filePath, artist, title, duration, coverData, converted, cacheKey)
-		if err != nil {
-			log.Printf("[audio] %s: sendWithEmbeddedCover ошибка: %v", filePath, err)
-		}
-		completeAudioTask(rootTmp)
-		return err
-	}
 
 	chatID := c.Sender().ID
 	audioDir := filepath.Dir(filePath)
@@ -300,8 +420,42 @@ func processAudioFileNormally(c tele.Context, filePath string, hash string, root
 
 	track := queuedTrack{Path: filePath, Artist: artist, Title: title, Duration: duration, CacheKey: cacheKey}
 
-	if val, ok := pendingCovers.Load(key); ok {
-		pc := val.(*PendingCover)
+	// Картинки (включая вшитую в САМ этот файл обложку — см. ниже) готовим
+	// ДО попытки застолбить запись в pendingCovers, а не после: конвейер
+	// (см. pipelineConcurrency в manager.go) обрабатывает несколько файлов
+	// ОДНОЙ папки параллельно, и несколько треков могут одновременно
+	// увидеть "новой папки ещё нет" — без атомарности между проверкой и
+	// записью (раньше здесь был отдельный Load, а Store — уже после
+	// подготовки картинок) второй трек создавал СВОЙ PendingCover и
+	// перезаписывал им первый в map, вместе с которым бесследно терялся
+	// уже добавленный туда первый трек. Из-за этого и терялись отдельные
+	// треки в альбомах без cue — см. историю чата. LoadOrStore ниже делает
+	// "проверить или застолбить" одной атомарной операцией.
+	images := findImagesInDir(audioDir)
+	if hasCover && len(coverData) > 0 {
+		if embeddedPath, err := saveEmbeddedCoverOption(audioDir, coverData); err == nil {
+			images = append([]string{embeddedPath}, images...)
+		} else {
+			log.Printf("[audio] %s: не удалось сохранить вшитую обложку для меню: %v", filePath, err)
+		}
+	}
+
+	newPC := &PendingCover{
+		AudioPaths: []queuedTrack{track},
+		AudioDir:   audioDir,
+		Hash:       hash,
+		Images:     images,
+		RootTmp:    rootTmp,
+	}
+	actual, loaded := pendingCovers.LoadOrStore(key, newPC)
+	pc := actual.(*PendingCover)
+
+	if loaded {
+		// Кто-то другой (другой трек этой же папки, обрабатываемый
+		// конкурентно) застолбил запись первым — картинки, подготовленные
+		// выше, просто не пригодились (embeddedPath из saveEmbeddedCoverOption
+		// останется неиспользованным файлом в audioDir, но уйдёт вместе со
+		// всей tmpDir задачи, как и остальные — не утечка).
 		pc.mu.Lock()
 		decided := pc.Skipped || pc.Selected != ""
 		if !decided {
@@ -320,16 +474,8 @@ func processAudioFileNormally(c tele.Context, filePath string, hash string, root
 		return nil
 	}
 
-	images := findImagesInDir(audioDir)
 	log.Printf("[audio] %s: новая папка %s, найдено картинок=%d", filePath, audioDir, len(images))
-	pc := &PendingCover{
-		AudioPaths: []queuedTrack{track},
-		AudioDir:   audioDir,
-		Hash:       hash,
-		Images:     images,
-		RootTmp:    rootTmp,
-	}
-	pendingCovers.Store(key, pc)
+	maybeSendAlbumSeparator(c, rootTmp, audioDir)
 
 	var err error
 	if len(images) > 0 {
@@ -350,62 +496,84 @@ func processAudioFileNormally(c tele.Context, filePath string, hash string, root
 // finishAudioProcessing обрабатывает один трек, для папки которого решение
 // по обложке уже принято.
 func finishAudioProcessing(c tele.Context, pc *PendingCover, track queuedTrack, rootTmp string) error {
-	var err error
 	pc.mu.Lock()
 	selected := pc.Selected
 	pc.mu.Unlock()
 
-	if selected != "" {
-		err = applyCoverToFile(c, pc, track.Path, selected, track.Artist, track.Title, track.Duration, track.CacheKey)
-	} else {
-		err = sendAudio(c, track.Path, track.Artist, track.Title, track.Duration, nil, track.CacheKey)
-	}
+	err := deliverTrack(c, pc, track, selected)
 	completeAudioTask(rootTmp)
 	return err
 }
 
-// sendWithEmbeddedCover отправляет трек, у которого обложка уже была вшита
-// в исходный файл. reembed=true означает, что файл был сконвертирован
-// (FLAC -> M4A) и обложку нужно вшить заново, т.к. конвертация её удалила.
-func sendWithEmbeddedCover(c tele.Context, filePath, artist, title string, duration int, coverData []byte, reembed bool, cacheKey string) error {
-	coverPath, err := saveCoverDataToTemp(coverData)
-	if err != nil {
-		// Не смогли сохранить картинку во временный файл — отправляем
-		// без превью (в не-сконвертированном файле обложка и так внутри).
-		return sendAudio(c, filePath, artist, title, duration, nil, cacheKey)
-	}
-	defer os.Remove(coverPath)
+// deliverTrack отправляет один трек с уже принятым решением по обложке
+// (coverPath == "" значит "без обложки"). Общая точка для всех путей,
+// которыми может завершиться выбор обложки папки (см. finishAudioProcessing,
+// handleCoverSelection, handleCoverSkip, handleCustomCoverUpload).
+// Инкапсулирует порядок "сначала пробуем юзербота без перекодирования для
+// FLAC, конвертируем в M4A только если он недоступен или откатился" — этот
+// выбор раньше делался ДО выбора обложки (см. processAudioFileNormally),
+// из-за чего пользователь для FLAC вообще не видел меню.
+func deliverTrack(c tele.Context, pc *PendingCover, track queuedTrack, coverPath string) error {
+	ext := strings.ToLower(filepath.Ext(track.Path))
 
-	if reembed {
-		// applyCoverToFile сам сожмёт до ≤200 КБ, вошьёт и подставит превью.
-		return applyCoverToFile(c, nil, filePath, coverPath, artist, title, duration, cacheKey)
+	if ext == ".flac" && userbot.Ready() {
+		var coverBytes []byte
+		if coverPath != "" {
+			if pc != nil {
+				coverBytes, _ = pc.getCompressedCoverBytes(coverPath)
+			} else {
+				coverBytes, _ = compressCoverBytes(coverPath)
+			}
+		}
+		if trySendFlacViaUserbotWithCover(c, track.Path, track.Artist, track.Title, track.Duration, coverBytes, track.CacheKey) {
+			return nil
+		}
 	}
 
-	// Обложка уже внутри файла — готовим только превью ≤200 КБ.
-	var thumb []byte
-	if compressed, cErr := compressCoverForEmbed(coverPath); cErr == nil {
-		thumb, _ = os.ReadFile(compressed)
-		os.Remove(compressed)
-	} else if len(coverData) <= 200*1024 {
-		thumb = coverData
+	filePath := track.Path
+	if ext == ".flac" {
+		log.Printf("[audio] %s: конвертация FLAC -> M4A начата", filePath)
+		m4aPath, err := convertToM4A(filePath)
+		if err != nil {
+			log.Printf("[audio] %s: конвертация FLAC -> M4A не удалась: %v, отправляем как FLAC", filePath, err)
+		} else {
+			log.Printf("[audio] %s: конвертация FLAC -> M4A успешна -> %s", filePath, m4aPath)
+			filePath = m4aPath
+		}
 	}
-	return sendAudio(c, filePath, artist, title, duration, thumb, cacheKey)
+
+	if coverPath != "" {
+		return applyCoverToFile(c, pc, filePath, coverPath, track.Artist, track.Title, track.Duration, track.CacheKey)
+	}
+	return sendAudio(c, filePath, track.Artist, track.Title, track.Duration, nil, track.CacheKey)
 }
 
-// saveCoverDataToTemp сохраняет байты вшитой обложки во временный файл с
-// корректным расширением (jpg/png по сигнатуре) — ffmpeg надёжнее
-// определяет формат входной картинки по расширению.
-func saveCoverDataToTemp(data []byte) (string, error) {
+// saveEmbeddedCoverOption сохраняет обложку, уже вшитую в аудиофайл, как
+// файл-кандидат в меню выбора обложки папки (см. offerCoverSelection —
+// подпись кнопки берётся из filepath.Base). Кладём её ПРЯМО В audioDir —
+// той же tmpDir задачи, что и остальные картинки папки. Чистится вместе со
+// всей задачей (см. ownedByAudioProcessor в manager.go), отдельно удалять
+// не нужно.
+//
+// Имя ОБЯЗАНО быть уникальным (через os.CreateTemp), а не фиксированным
+// "Встроенная обложка.ext": эту функцию вызывает КАЖДЫЙ трек папки со
+// своей вшитой обложкой, ещё до того как известно, чей PendingCover
+// победит гонку за pendingCovers.LoadOrStore (см. processAudioFileNormally)
+// — конвейер обрабатывает несколько треков одной папки конкурентно
+// (pipelineConcurrency в manager.go), и с фиксированным именем несколько
+// треков одновременно писали бы поверх ОДНОГО и того же файла, из-за чего
+// показанная в меню "встроенная обложка" могла оказаться от чужого трека.
+func saveEmbeddedCoverOption(audioDir string, coverData []byte) (string, error) {
 	ext := ".jpg"
-	if len(data) >= 8 && bytes.HasPrefix(data, []byte{0x89, 'P', 'N', 'G'}) {
+	if len(coverData) >= 8 && bytes.HasPrefix(coverData, []byte{0x89, 'P', 'N', 'G'}) {
 		ext = ".png"
 	}
-	f, err := os.CreateTemp("", "embcover_*"+ext)
+	f, err := os.CreateTemp(audioDir, "Встроенная обложка *"+ext)
 	if err != nil {
 		return "", err
 	}
 	path := f.Name()
-	if _, err := f.Write(data); err != nil {
+	if _, err := f.Write(coverData); err != nil {
 		f.Close()
 		os.Remove(path)
 		return "", err
@@ -474,17 +642,35 @@ func readAudioInfo(filePath string) (artist, title string, duration int, hasCove
 	return
 }
 
+// sideSuffixRe вырезает хвост вида "Side A"/"SideB"/"Side 1" из разобранного
+// имени файла — это маркер стороны пластинки/диска (см. parseFileName),
+// а не часть реального названия трека; если в файле всего один трек, для
+// пользователя это просто мусор в конце тайтла.
+var sideSuffixRe = regexp.MustCompile(`(?i)\s+side\s*[a-z0-9]+$`)
+
 func parseFileName(filePath string) (artist, title string) {
 	base := filepath.Base(filePath)
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
-	parts := strings.SplitN(name, " - ", 2)
-	if len(parts) == 2 {
-		artist = strings.TrimSpace(parts[0])
-		title = strings.TrimSpace(parts[1])
-	} else {
-		title = strings.TrimSpace(name)
+
+	// Некоторые релизы (особенно старые сканы/риппы) называют файлы с
+	// подчёркиваниями вместо пробелов — "Artist_Name_-_Track_Title.flac".
+	// Обычный разделитель " - " в таком имени не встретится ни разу, зато
+	// встретится "_-_" — переключаемся на него и заодно заменяем оставшиеся
+	// подчёркивания на пробелы для читаемости.
+	sep := " - "
+	if !strings.Contains(name, sep) && strings.Contains(name, "_-_") {
+		sep = "_-_"
 	}
+
+	parts := strings.SplitN(name, sep, 2)
+	if len(parts) == 2 {
+		artist = strings.TrimSpace(strings.ReplaceAll(parts[0], "_", " "))
+		title = strings.TrimSpace(strings.ReplaceAll(parts[1], "_", " "))
+	} else {
+		title = strings.TrimSpace(strings.ReplaceAll(name, "_", " "))
+	}
+	title = strings.TrimSpace(sideSuffixRe.ReplaceAllString(title, ""))
 	return
 }
 
@@ -640,21 +826,23 @@ func compressCoverForEmbed(coverPath string) (string, error) {
 	return "", fmt.Errorf("не удалось сжать обложку")
 }
 
-// trySendFlacViaUserbot пытается доставить FLAC без перекодирования: юзербот
-// (MTProto) заливает файл в служебную релей-группу, а бот (Bot API)
+// trySendFlacViaUserbotWithCover пытается доставить FLAC без перекодирования:
+// юзербот (MTProto) заливает файл в служебную релей-группу, а бот (Bot API)
 // копирует сообщение оттуда в чат с пользователем — см. package-level
 // комментарий tgbot/userbot/client.go про то, почему напрямую пользователю
-// написать нельзя. Возвращает false в любом случае, когда трек нужно
+// написать нельзя. coverBytes — уже выбранная пользователем обложка (или
+// nil, если решил без обложки, см. deliverTrack) — раньше эта функция сама
+// автовыбирала обложку (cueAlbumCover) ДО того, как пользователь вообще
+// видел меню выбора. Возвращает false в любом случае, когда трек нужно
 // отправлять обычным путём (юзербот/релей не готовы либо сама отправка не
 // удалась) — вызывающая сторона тогда продолжает как раньше (convertToM4A +
 // Bot API).
-func trySendFlacViaUserbot(c tele.Context, filePath, artist, title string, duration int, cacheKey string) bool {
+func trySendFlacViaUserbotWithCover(c tele.Context, filePath, artist, title string, duration int, coverBytes []byte, cacheKey string) bool {
 	if !userbot.Ready() {
 		return false
 	}
 
-	thumb := cueAlbumCover(filePath)
-	msgID, chatID, err := userbot.SendToRelay(context.Background(), filePath, title, artist, duration, thumb)
+	msgID, chatID, err := userbot.SendToRelay(context.Background(), filePath, title, artist, duration, coverBytes)
 	if err != nil {
 		log.Printf("[audio] %s: userbot.SendToRelay ошибка, откат на Bot API: %v", filePath, err)
 		return false
@@ -824,14 +1012,50 @@ func writeTempCoverFile(data []byte) (string, error) {
 	return path, nil
 }
 
+// coverButtonsPerRow — сколько кнопок выбора обложки помещать в один ряд
+// таблицы (см. offerCoverSelection) — 2 достаточно широко для длинных имён
+// файлов и не разъезжается на экране телефона.
+const coverButtonsPerRow = 2
+
+// offerCoverSelection показывает меню выбора обложки в два шага: сначала
+// КАЖДАЯ картинка-кандидат отдельным сообщением-документом (без кнопок —
+// просто посмотреть, как она выглядит), а затем ОДНО отдельное сообщение
+// с таблицей кнопок выбора, каждая подписана именем файла — так видно,
+// какая кнопка какой картинке соответствует, не заваливая при этом каждую
+// картинку своей парой кнопок. Документом (не фото) — Telegram всё равно
+// показывает превью-миниатюру для документа-картинки, а в обычном потоке
+// (см. uploadFileFromDisk в tgbot/torr/manager.go) та же картинка уже была
+// один раз показана как фото, в порядке торрента — это НЕ то же самое
+// сообщение, а отдельный повторный показ специально для меню.
 func offerCoverSelection(c tele.Context, hash string, images []string, dirHash, audioDir string) error {
 	folderName := filepath.Base(audioDir)
 
+	for i, img := range images {
+		doc := &tele.Document{
+			FileName: filepath.Base(img),
+			Caption:  fmt.Sprintf("Вариант %d: %s", i+1, filepath.Base(img)),
+			File:     tele.FromDisk(img),
+		}
+		sentMsg, err := c.Bot().Send(c.Recipient(), doc)
+		if err != nil {
+			log.Printf("[audio] не удалось показать превью обложки %q: %v", img, err)
+			continue
+		}
+		storePickerMsg(c, hash, dirHash, sentMsg)
+	}
+
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
+	var rowBtns []tele.Btn
 	for i, img := range images {
-		btn := markup.Data(filepath.Base(img), "\fcover", hash, strconv.Itoa(i), dirHash)
-		rows = append(rows, markup.Row(btn))
+		rowBtns = append(rowBtns, markup.Data(filepath.Base(img), "\fcover", hash, strconv.Itoa(i), dirHash))
+		if len(rowBtns) == coverButtonsPerRow {
+			rows = append(rows, markup.Row(rowBtns...))
+			rowBtns = nil
+		}
+	}
+	if len(rowBtns) > 0 {
+		rows = append(rows, markup.Row(rowBtns...))
 	}
 	rows = append(rows, markup.Row(
 		markup.Data("▶️ Без обложки", "\fskip", hash, dirHash),
@@ -871,7 +1095,7 @@ func storePickerMsg(c tele.Context, hash, dirHash string, msg *tele.Message) {
 	if val, ok := pendingCovers.Load(key); ok {
 		pc := val.(*PendingCover)
 		pc.mu.Lock()
-		pc.PickerMsg = msg
+		pc.PickerMsgs = append(pc.PickerMsgs, msg)
 		pc.mu.Unlock()
 	}
 }
@@ -886,20 +1110,31 @@ func handleCoverSkip(c tele.Context, hash, dirHash string) error {
 	pc := val.(*PendingCover)
 
 	pc.mu.Lock()
+	if pc.Consumed {
+		pc.mu.Unlock()
+		return c.Respond(&tele.CallbackResponse{Text: "Уже обработано"})
+	}
+	pc.Consumed = true
 	pc.Skipped = true
 	pc.Selected = ""
 	paths := pc.AudioPaths
 	pc.AudioPaths = nil
-	pickerMsg := pc.PickerMsg
+	pickerMsgs := pc.PickerMsgs
 	pc.mu.Unlock()
 
-	if pickerMsg != nil {
-		c.Bot().Delete(pickerMsg)
+	for _, m := range pickerMsgs {
+		c.Bot().Delete(m)
+	}
+
+	if pc.CueSplit != nil {
+		err := finishCueSplit(c, pc.CueSplit, "")
+		completeAudioTask(pc.CueSplit.RootTmp)
+		return err
 	}
 
 	var lastErr error
 	for _, track := range paths {
-		if err := sendAudio(c, track.Path, track.Artist, track.Title, track.Duration, nil, track.CacheKey); err != nil {
+		if err := deliverTrack(c, pc, track, ""); err != nil {
 			lastErr = err
 		}
 		completeAudioTask(pc.RootTmp)
@@ -921,20 +1156,31 @@ func handleCoverSelection(c tele.Context, hash string, imgIndex int, dirHash str
 	coverPath := pc.Images[imgIndex]
 
 	pc.mu.Lock()
+	if pc.Consumed {
+		pc.mu.Unlock()
+		return c.Respond(&tele.CallbackResponse{Text: "Уже обработано"})
+	}
+	pc.Consumed = true
 	pc.Selected = coverPath
 	pc.Skipped = false
 	paths := pc.AudioPaths
 	pc.AudioPaths = nil
-	pickerMsg := pc.PickerMsg
+	pickerMsgs := pc.PickerMsgs
 	pc.mu.Unlock()
 
-	if pickerMsg != nil {
-		c.Bot().Delete(pickerMsg)
+	for _, m := range pickerMsgs {
+		c.Bot().Delete(m)
+	}
+
+	if pc.CueSplit != nil {
+		err := finishCueSplit(c, pc.CueSplit, coverPath)
+		completeAudioTask(pc.CueSplit.RootTmp)
+		return err
 	}
 
 	var lastErr error
 	for _, track := range paths {
-		if err := applyCoverToFile(c, pc, track.Path, coverPath, track.Artist, track.Title, track.Duration, track.CacheKey); err != nil {
+		if err := deliverTrack(c, pc, track, coverPath); err != nil {
 			lastErr = err
 		}
 		completeAudioTask(pc.RootTmp)
@@ -986,20 +1232,32 @@ func handleCustomCoverUpload(c tele.Context, hash, dirHash string, msg *tele.Mes
 	}
 
 	pc.mu.Lock()
+	if pc.Consumed {
+		pc.mu.Unlock()
+		os.Remove(tmpPath)
+		return c.Send("Уже обработано.")
+	}
+	pc.Consumed = true
 	pc.Selected = tmpPath
 	pc.Skipped = false
 	paths := pc.AudioPaths
 	pc.AudioPaths = nil
-	pickerMsg := pc.PickerMsg
+	pickerMsgs := pc.PickerMsgs
 	pc.mu.Unlock()
 
-	if pickerMsg != nil {
-		c.Bot().Delete(pickerMsg)
+	for _, m := range pickerMsgs {
+		c.Bot().Delete(m)
+	}
+
+	if pc.CueSplit != nil {
+		err := finishCueSplit(c, pc.CueSplit, tmpPath)
+		completeAudioTask(pc.CueSplit.RootTmp)
+		return err
 	}
 
 	var lastErr error
 	for _, track := range paths {
-		if e := applyCoverToFile(c, pc, track.Path, tmpPath, track.Artist, track.Title, track.Duration, track.CacheKey); e != nil {
+		if e := deliverTrack(c, pc, track, tmpPath); e != nil {
 			lastErr = e
 		}
 		completeAudioTask(pc.RootTmp)
