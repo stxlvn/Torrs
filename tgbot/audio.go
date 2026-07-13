@@ -18,6 +18,7 @@ import (
 
 	"github.com/dhowden/tag"
 	tele "gopkg.in/telebot.v4"
+	"torrsru/tgbot/torr"
 )
 
 // PendingCover описывает состояние выбора обложки для ОДНОЙ ПАПКИ торрента.
@@ -174,7 +175,14 @@ func completeAudioTask(rootTmp string) {
 	}
 }
 
-func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp string) error {
+// ProcessAudioFile — точка входа AudioProcessor. oversized=true означает,
+// что manager.go пропустил файл сюда В ОБХОД порога safePartSize только
+// потому, что рядом нашёлся .cue (см. isCueSplitCandidate/hasSiblingCueFile
+// в tgbot/torr/cue.go) — если по итогу нарезка не состоится (cue не
+// разобрался/пользователь отказался), файл всё равно превышает лимит
+// одиночной отправки, и нужно откатиться на fallback (7z-архивация через
+// LargeFileProcessor). Когда oversized=false, fallback всегда nil.
+func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp string, oversized bool, fallback func() error) error {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	if ext != ".mp3" && ext != ".flac" && ext != ".m4a" && ext != ".ogg" {
 		// Задача была зарегистрирована manager'ом до вызова — закрываем,
@@ -182,6 +190,48 @@ func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp stri
 		completeAudioTask(rootTmp)
 		return nil
 	}
+
+	// Cue-sheet проверяем ДО конвертации в M4A: если пользователь подтвердит
+	// нарезку, резать (и заодно перекодировать под Bot API) нужно из
+	// исходного FLAC по кускам, а не из уже сконвертированного целиком
+	// файла. Сопроводительные .cue на диск кладёт prefetchCueSheets в
+	// tgbot/torr/cue.go — до вызова ProcessAudioFile. В папке может быть
+	// несколько .cue (или один общий на несколько файлов, см.
+	// CueFileSection) — перебираем все, пока какой-то не подойдёт именно
+	// этому файлу.
+	if ext == ".flac" {
+		for _, cuePath := range findSiblingCueFiles(filePath) {
+			handled, err := offerCueSplit(c, filePath, cuePath, hash, rootTmp, oversized, fallback)
+			if handled {
+				return err
+			}
+			// этот .cue не описывает данный файл/не разобрался — пробуем
+			// следующий, а если это был последний — обычный путь ниже.
+		}
+	}
+
+	if oversized {
+		// Не оказался настоящим cue-кандидатом, но превышает лимит
+		// одиночной отправки — уходим в 7z-архивацию тем же путём, что и
+		// раньше (до того как manager.go пропустил файл сюда в обход
+		// порога). Порядок важен: сначала fallback (файл на диске ещё
+		// должен существовать), потом completeAudioTask — иначе счётчик
+		// может дойти до нуля и папка удалится до того, как архиватор
+		// прочитает файл.
+		err := fallback()
+		completeAudioTask(rootTmp)
+		return err
+	}
+
+	return processAudioFileNormally(c, filePath, hash, rootTmp)
+}
+
+// processAudioFileNormally — путь одиночного трека (без нарезки по cue):
+// конвертация FLAC->M4A, определение обложки, отправка. Вызывается как из
+// ProcessAudioFile напрямую (cue не найден), так и из
+// handleCueSplitDecline, когда пользователь отказался от нарезки.
+func processAudioFileNormally(c tele.Context, filePath string, hash string, rootTmp string) error {
+	ext := strings.ToLower(filepath.Ext(filePath))
 
 	// Проверяем вшитую обложку в ИСХОДНОМ файле — до конвертации,
 	// потому что convertToM4A (-vn) выбрасывает встроенную картинку.
@@ -564,6 +614,14 @@ func compressCoverForEmbed(coverPath string) (string, error) {
 	return "", fmt.Errorf("не удалось сжать обложку")
 }
 
+// maxAudioSendRetries — сколько раз повторить отправку трека при сетевой
+// ошибке (в т.ч. EOF от локального Bot API сервера). Раньше отправка была
+// одноразовой: в отличие от обычных файлов (см. sendWithRetry в
+// tgbot/torr/manager.go), трек с тегами/обложкой уходил через sendAudio без
+// единой попытки повтора, и любой транзиентный обрыв соединения превращал
+// уже готовый к отправке файл в постоянную ошибку выгрузки.
+const maxAudioSendRetries = 5
+
 func sendAudio(c tele.Context, filePath, artist, title string, duration int, coverData []byte) error {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -574,7 +632,6 @@ func sendAudio(c tele.Context, filePath, artist, title string, duration int, cov
 	ext := strings.ToLower(filepath.Ext(filePath))
 
 	audio := &tele.Audio{
-		File: tele.FromReader(file),
 		// Явно указываем имя файла — без этого Telegram/telebot может
 		// подставить формат по умолчанию (mp3), даже если реально
 		// отправляется m4a/flac/ogg.
@@ -593,19 +650,35 @@ func sendAudio(c tele.Context, filePath, artist, title string, duration int, cov
 	case ".mp3":
 		audio.MIME = "audio/mpeg"
 	}
-	if len(coverData) > 0 {
-		audio.Thumbnail = &tele.Photo{
-			File: tele.FromReader(bytes.NewReader(coverData)),
+
+	var sendErr error
+	for attempt := 1; attempt <= maxAudioSendRetries; attempt++ {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		audio.File = tele.FromReader(file)
+		if len(coverData) > 0 {
+			// Пересоздаём Reader на каждую попытку — bytes.Reader после
+			// первой успешной/неудачной отправки уже вычитан до конца.
+			audio.Thumbnail = &tele.Photo{
+				File: tele.FromReader(bytes.NewReader(coverData)),
+			}
+		}
+
+		start := time.Now()
+		_, sendErr = c.Bot().Send(c.Recipient(), audio)
+		if sendErr == nil {
+			log.Printf("[audio] sendAudio %s: OK after %v (попытка %d/%d)", filePath, time.Since(start), attempt, maxAudioSendRetries)
+			return nil
+		}
+
+		delay := torr.FloodRetryDelay(sendErr, 5*time.Second)
+		log.Printf("[audio] sendAudio %s: попытка %d/%d FAILED after %v: %v (ждём %v)", filePath, attempt, maxAudioSendRetries, time.Since(start), sendErr, delay)
+		if attempt < maxAudioSendRetries {
+			time.Sleep(delay)
 		}
 	}
-	start := time.Now()
-	_, err = c.Bot().Send(c.Recipient(), audio)
-	if err != nil {
-		log.Printf("[audio] sendAudio %s: FAILED after %v: %v", filePath, time.Since(start), err)
-	} else {
-		log.Printf("[audio] sendAudio %s: OK after %v", filePath, time.Since(start))
-	}
-	return err
+	return sendErr
 }
 
 // findImagesInDir ищет в папке файлы-обложки. Поиск регистронезависимый

@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,8 +28,12 @@ import (
 const safePartSize = 1_900_000_000
 
 var (
-	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string) error
-	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool) error
+	// oversized сообщает, что файл превышает safePartSize и в обход был
+	// пропущен к AudioProcessor как кандидат на нарезку по cue; fallback
+	// (не nil ровно тогда, когда oversized) — откат на LargeFileProcessor
+	// (7z-архивация), если cue в итоге не подтвердится/не найдётся.
+	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string, oversized bool, fallback func() error) error
+	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool, kbd *tele.ReplyMarkup) error
 
 	// Хуки учёта задач по временной папке торрента (реализация — в
 	// tgbot/audio.go, привязка — в tgbot/bot.go). Схема:
@@ -112,6 +117,24 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 		log.Printf("[manager] AddRange: очередь переполнена (%d), отказ user=%d hash=%s", len(m.queue), c.Sender().ID, hash)
 		c.Bot().Send(c.Recipient(), "Очередь переполнена, попробуйте попозже\n\nЭлементов в очереди:"+strconv.Itoa(len(m.queue)))
 		return
+	}
+
+	// Идемпотентность: Telegram (в т.ч. локальный Bot API сервер) может
+	// повторно доставить одно и то же обновление — например, если процесс
+	// перезапустился до того, как успел уйти следующий getUpdates с
+	// продвинутым offset. Раньше здесь проверялась только очередь
+	// (m.queue), а уже АКТИВНО обрабатываемая задача (m.working) — нет,
+	// из-за чего повторно доставленный колбэк "Скачать выбранное" запускал
+	// скачивание и выгрузку (в т.ч. обложки/cue) заново с нуля, параллельно
+	// с ещё идущей первой попыткой. В m.working задачу нельзя молча
+	// "дозаполнить" файлами, как в очереди ниже: её fileIndices уже читает
+	// в цикле loading() в отдельной горутине, и конкурентный append сюда
+	// был бы гонкой данных — поэтому просто игнорируем дубликат.
+	for _, w := range m.working {
+		if w.torrentHash == hash && w.c.Sender().ID == c.Sender().ID {
+			log.Printf("[manager] AddRange: hash=%s user=%d уже обрабатывается worker=%d — повторный запрос проигнорирован (вероятно, повторно доставленное обновление Telegram)", hash, c.Sender().ID, w.id)
+			return
+		}
 	}
 
 	var existingWrk *Worker
@@ -381,6 +404,10 @@ func loading(wrk *Worker) {
 		defer os.RemoveAll(tmpDir)
 	}
 
+	if AudioProcessor != nil {
+		prefetchCueSheets(wrk)
+	}
+
 	iserr := false
 	totalFiles := len(wrk.fileIndices)
 
@@ -553,6 +580,14 @@ func isImageExt(path string) bool {
 	return false
 }
 
+// maxDownloadRetries — сколько раз повторить скачивание файла с TorrServer
+// при сетевом сбое (оборванное соединение к 127.0.0.1:8090, unexpected EOF
+// и т.п.), прежде чем считать задачу окончательно проваленной. Раньше
+// единственный такой сбой обрывал всю задачу целиком и требовал от
+// пользователя запускать закачку заново — при том, что для отправки в
+// Telegram (см. sendWithRetry/sendVolumeWithRetry) ретраи уже были.
+const maxDownloadRetries = 5
+
 func downloadFileToDisk(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (string, error) {
 	tgfid := ""
 	if !isImageExt(file.Path) {
@@ -564,6 +599,35 @@ func downloadFileToDisk(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (s
 		return "", nil
 	}
 
+	var lastErr error
+	for attempt := 1; attempt <= maxDownloadRetries; attempt++ {
+		if wrk.isCancelled.Load() {
+			return "", errors.New("скачивание отменено пользователем")
+		}
+
+		fullPath, err := downloadFileToDiskOnce(wrk, file, fi, fc)
+		if err == nil {
+			wrk.downloadedBytes.Add(file.Length)
+			return fullPath, nil
+		}
+		if wrk.isCancelled.Load() {
+			// Отмена пользователем — не сетевой сбой, ретраить не нужно.
+			return "", errors.New("скачивание отменено пользователем")
+		}
+
+		lastErr = err
+		log.Printf("[manager] downloadFileToDisk: %q попытка %d/%d FAILED: %v", file.Path, attempt, maxDownloadRetries, err)
+		if attempt < maxDownloadRetries {
+			time.Sleep(3 * time.Second)
+		}
+	}
+	return "", lastErr
+}
+
+// downloadFileToDiskOnce — одна попытка скачивания. Каждая попытка заново
+// открывает поток и создаёт (с усечением) файл на диске — частично
+// скачанные данные от предыдущей неудачной попытки не переиспользуются.
+func downloadFileToDiskOnce(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (string, error) {
 	torrFile, err := NewTorrFile(wrk, file)
 	if err != nil {
 		log.Printf("[manager] downloadFileToDisk: не удалось открыть поток %q: %v", file.Path, err)
@@ -613,7 +677,6 @@ func downloadFileToDisk(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (s
 		return "", copyErr
 	}
 
-	wrk.downloadedBytes.Add(file.Length)
 	return fullPath, nil
 }
 
@@ -652,30 +715,61 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 
 	caption := filepath.Base(file.Path)
 
+	isAudio := isAudioExt(file.Path)
+
+	// Кандидат на нарезку по cue (целый альбом одним FLAC + .cue рядом)
+	// пропускает порог safePartSize: после нарезки отдельные треки в разы
+	// меньше исходного альбома и 7z-архивация им не нужна. Раньше такие
+	// хайрез-альбомы (24/192 и т.п., которые запросто превышают 1.9 ГБ
+	// одним файлом) всегда уходили в архив, даже не долетев до
+	// AudioProcessor — пользователь вообще не видел предложения нарезать.
+	isCueCandidate := isAudio && AudioProcessor != nil && isProcessableAudio(file.Path) &&
+		isCueSplitCandidate(file.Path) && hasSiblingCueFile(diskPath)
+
+	buildLargeFileFallback := func() func() error {
+		if LargeFileProcessor == nil {
+			return nil
+		}
+		// Кнопку строим здесь и передаём явно — раньше LargeFileProcessor
+		// брал её из wrk.msg.ReplyMarkup, а это поле никогда не обновляется
+		// после Edit() (возвращаемое значение везде отбрасывается), из-за
+		// чего оно оставалось nil и первый же Edit внутри архивации стирал
+		// кнопку "Отмена" с реального сообщения в Telegram.
+		torrKbd := &tele.ReplyMarkup{}
+		torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
+		return func() error {
+			return LargeFileProcessor(wrk.c, diskPath, file.Length, file.Path, wrk.torrentHash, wrk.msg, wrk.isCancelled.Load, torrKbd)
+		}
+	}
+
 	// Статус-сообщение здесь больше не редактируется точечно под этот один
 	// файл — при конкурентной выгрузке (см. uploadAllFiles) "текущий файл"
 	// перестал быть осмысленным понятием (одновременно грузится несколько).
 	// Совокупный прогресс по всей задаче показывает reportUploadProgress,
 	// вызываемый из uploadAllFiles до старта и после завершения каждого
 	// файла.
-	if file.Length >= safePartSize {
-		if LargeFileProcessor != nil {
-			return LargeFileProcessor(wrk.c, diskPath, file.Length, file.Path, wrk.torrentHash, wrk.msg, wrk.isCancelled.Load)
-		} else {
-			return errors.New("файл превышает 1.9 ГБ, разбиение не настроено")
+	if file.Length >= safePartSize && !isCueCandidate {
+		fallback := buildLargeFileFallback()
+		if fallback != nil {
+			return fallback()
 		}
+		return errors.New("файл превышает 1.9 ГБ, разбиение не настроено")
 	}
-
-	isAudio := isAudioExt(file.Path)
 
 	if isAudio && AudioProcessor != nil && isProcessableAudio(file.Path) {
 		// Регистрируем интерактивную аудиозадачу ДО вызова обработчика:
 		// её закроет tgbot/audio.go, когда трек будет реально отправлен
-		// (в т.ч. после того как пользователь выберет обложку).
+		// (в т.ч. после того как пользователь выберет обложку, подтвердит
+		// нарезку по cue, либо она в итоге откатится на 7z-архивацию).
 		if AddAudioTask != nil {
 			AddAudioTask(wrk.tmpDir)
 		}
-		return AudioProcessor(wrk.c, diskPath, wrk.torrentHash, wrk.tmpDir)
+		oversized := file.Length >= safePartSize
+		var fallback func() error
+		if oversized {
+			fallback = buildLargeFileFallback()
+		}
+		return AudioProcessor(wrk.c, diskPath, wrk.torrentHash, wrk.tmpDir, oversized, fallback)
 	}
 
 	fileReader, err := os.Open(diskPath)
@@ -723,6 +817,34 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 // повторными попытками при сетевых ошибках и сохраняет полученный от
 // Telegram FileID в кэше, чтобы повторные запросы того же файла отдавались
 // без повторного скачивания/выгрузки.
+// retryAfterRe вылавливает "retry after N" из текста ошибки. Нужен как
+// fallback: локальный self-hosted Bot API сервер иногда отдаёт flood-control
+// с error_code=400 ("Bad Request") вместо стандартного 429, и telebot в
+// этом случае НЕ оборачивает ошибку в FloodError (см. extractOk в
+// bot_raw.go — там на code=429 завязана сборка FloodError), хотя текст
+// описания всё равно содержит "retry after N".
+var retryAfterRe = regexp.MustCompile(`retry after (\d+)`)
+
+// FloodRetryDelay вычисляет паузу перед повторной попыткой отправки.
+// Telegram при flood control явно указывает, сколько секунд ждать — раньше
+// это игнорировалось, и ретрай с фиксированной паузой (2-5с) снова и снова
+// упирался в тот же самый лимит, пока не истощал все попытки. Если ошибка
+// не про flood-control, отдаём fallback.
+func FloodRetryDelay(err error, fallback time.Duration) time.Duration {
+	var floodErr tele.FloodError
+	if errors.As(err, &floodErr) && floodErr.RetryAfter > 0 {
+		return time.Duration(floodErr.RetryAfter)*time.Second + time.Second
+	}
+	if err != nil {
+		if m := retryAfterRe.FindStringSubmatch(err.Error()); m != nil {
+			if secs, convErr := strconv.Atoi(m[1]); convErr == nil && secs > 0 {
+				return time.Duration(secs)*time.Second + time.Second
+			}
+		}
+	}
+	return fallback
+}
+
 func sendWithRetry(wrk *Worker, file *state.TorrentFileStat, sendable interface{}) error {
 	var sendErr error
 	for i := 0; i < 20; i++ {
@@ -733,8 +855,9 @@ func sendWithRetry(wrk *Worker, file *state.TorrentFileStat, sendable interface{
 		if sendErr == nil || errors.Is(sendErr, ERR_STOPPED) {
 			break
 		} else {
-			log.Printf("[manager] sendWithRetry: %q попытка %d/20 FAILED: %v", file.Path, i+1, sendErr)
-			time.Sleep(2 * time.Second)
+			delay := FloodRetryDelay(sendErr, 2*time.Second)
+			log.Printf("[manager] sendWithRetry: %q попытка %d/20 FAILED: %v (ждём %v)", file.Path, i+1, sendErr, delay)
+			time.Sleep(delay)
 		}
 	}
 

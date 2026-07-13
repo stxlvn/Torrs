@@ -635,6 +635,21 @@ func getTorrent(c tele.Context) error {
 		return c.Respond(&tele.CallbackResponse{Text: "Отправьте изображение для обложки"})
 	}
 
+	// === ОБРАБОТЧИКИ CUE-SHEET ===
+	if cmd == "\fcuesplit" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleCueSplitConfirm(c, args[1], args[2])
+	}
+
+	if cmd == "\fcueskip" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleCueSplitDecline(c, args[1], args[2])
+	}
+
 	log.Printf("[torrent] getTorrent: user=%d неизвестная команда cmd=%s", c.Sender().ID, cmd)
 	return errors.New("Неизвестная команда")
 }

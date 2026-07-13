@@ -74,15 +74,16 @@ func sendVolumeWithRetry(c tele.Context, partPath string, i, totalParts int, isC
 		}
 
 		lastErr = err
-		log.Printf("[largefile] том %d/%d: попытка %d/%d FAILED после %v: %v", i+1, totalParts, attempt, maxVolumeRetries, time.Since(partStart), err)
+		delay := torr.FloodRetryDelay(err, 5*time.Second)
+		log.Printf("[largefile] том %d/%d: попытка %d/%d FAILED после %v: %v (ждём %v)", i+1, totalParts, attempt, maxVolumeRetries, time.Since(partStart), err, delay)
 		if attempt < maxVolumeRetries {
-			time.Sleep(5 * time.Second)
+			time.Sleep(delay)
 		}
 	}
 	return lastErr
 }
 
-func ProcessLargeFile(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool) error {
+func ProcessLargeFile(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool, kbd *tele.ReplyMarkup) error {
 	log.Printf("ProcessLargeFile: START file=%s size=%d", filePath, fileSize)
 	if isCancelled == nil {
 		isCancelled = func() bool { return false }
@@ -113,11 +114,6 @@ func ProcessLargeFile(c tele.Context, filePath string, fileSize int64, fileName 
 			progressBar(upProgress), upProgress, upStatus,
 			hash,
 		)
-	}
-
-	var kbd *tele.ReplyMarkup
-	if statusMsg != nil {
-		kbd = statusMsg.ReplyMarkup
 	}
 
 	tmpDir, err := os.MkdirTemp("", "7z_out_*")

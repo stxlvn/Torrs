@@ -14,6 +14,7 @@ require (
 	go.etcd.io/bbolt v1.3.8
 	golang.org/x/crypto v0.44.0
 	golang.org/x/sync v0.18.0
+	golang.org/x/text v0.31.0
 	gopkg.in/telebot.v4 v4.0.0-beta.4
 )
 
@@ -67,7 +68,6 @@ require (
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
