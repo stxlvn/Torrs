@@ -68,7 +68,7 @@ func Start(token, host string) error {
 		{Text: "id", Description: "Узнать свой Telegram ID"},
 	})
 
-	_ = b.SetMyDescription("Бот для скачивания торрентов из поиска Torrs.ru. Поддерживает magnet-ссылки, хеши, .torrent файлы. Умеет добавлять теги и обложки к аудио.", "ru")
+	_ = b.SetMyDescription("Бот для скачивания торрентов. Поддерживает magnet-ссылки, хеши, .torrent файлы. Умеет добавлять теги и обложки к аудио.", "ru")
 	_ = b.SetMyShortDescription("Торрент-качалка с тегами и обложками", "ru")
 
 	b.Handle("help", help)
