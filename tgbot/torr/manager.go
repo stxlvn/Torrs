@@ -28,11 +28,15 @@ import (
 const safePartSize = 1_900_000_000
 
 var (
+	// fileID — id файла внутри торрента (state.TorrentFileStat.Id), нужен
+	// AudioProcessor'у для ключа кэша Telegram file_id (db.SaveTGFileID),
+	// чтобы при повторном запросе того же трека/торрента не качать и не
+	// обрабатывать заново, а переслать уже отправленный файл.
 	// oversized сообщает, что файл превышает safePartSize и в обход был
 	// пропущен к AudioProcessor как кандидат на нарезку по cue; fallback
 	// (не nil ровно тогда, когда oversized) — откат на LargeFileProcessor
 	// (7z-архивация), если cue в итоге не подтвердится/не найдётся.
-	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string, oversized bool, fallback func() error) error
+	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string, fileID int, oversized bool, fallback func() error) error
 	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool, kbd *tele.ReplyMarkup) error
 
 	// Хуки учёта задач по временной папке торрента (реализация — в
@@ -453,21 +457,57 @@ func loading(wrk *Worker) {
 const uploadConcurrency = 3
 
 // uploadAllFiles выгружает файлы задачи с ограниченной конкурентностью.
+// Изображения (обложки и т.п.) выгружаются ПЕРВОЙ, полностью завершённой
+// фазой — и только потом всё остальное (аудио, документы). При
+// uploadConcurrency > 1 порядок ЗАВЕРШЕНИЯ (а значит и порядок появления
+// сообщений в чате) не совпадает с порядком запуска, поэтому простой
+// сортировки wrk.fileIndices недостаточно — нужна отдельная, дождавшаяся
+// себя фаза, чтобы обложка гарантированно пришла в чат раньше треков.
 // Возвращает true, если хотя бы одна выгрузка завершилась ошибкой (в этом
 // случае пользователю уже отправлено сообщение об ошибке).
 func uploadAllFiles(wrk *Worker, totalFiles int) bool {
-	sem := make(chan struct{}, uploadConcurrency)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-	var firstErrFile string
-	var completed atomic.Int32
+	var images, rest []int
+	for _, fi := range wrk.fileIndices {
+		if isImageExt(wrk.ti.FileStats[fi].Path) {
+			images = append(images, fi)
+		} else {
+			rest = append(rest, fi)
+		}
+	}
 
 	wrk.reportUploadProgress(totalFiles, 0)
 
-	for idx, fileIndex := range wrk.fileIndices {
+	var completed atomic.Int32
+	if firstErr, firstErrFile := uploadBatch(wrk, totalFiles, images, &completed); firstErr != nil {
+		errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", firstErrFile, firstErr.Error())
+		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
+		return true
+	}
+	if wrk.isCancelled.Load() {
+		return false
+	}
+
+	if firstErr, firstErrFile := uploadBatch(wrk, totalFiles, rest, &completed); firstErr != nil {
+		errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", firstErrFile, firstErr.Error())
+		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
+		return true
+	}
+	return false
+}
+
+// uploadBatch выгружает один набор file-индексов с ограниченной
+// конкурентностью (uploadConcurrency), обновляя общий на всю задачу счётчик
+// completed (переиспользуется между фазами uploadAllFiles, чтобы прогресс-бар
+// считал по всей задаче, а не обнулялся между фазой картинок и остального).
+// Останавливается на первой ошибке: новые загрузки из этого батча не
+// стартуют, но уже запущенные — доигрываются.
+func uploadBatch(wrk *Worker, totalFiles int, fileIndices []int, completed *atomic.Int32) (firstErr error, firstErrFile string) {
+	sem := make(chan struct{}, uploadConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, fileIndex := range fileIndices {
 		if wrk.isCancelled.Load() {
-			log.Printf("[manager] loading: worker=%d: отменено, выгрузка файла %d/%d не запущена", wrk.id, idx+1, totalFiles)
 			break
 		}
 		mu.Lock()
@@ -479,7 +519,7 @@ func uploadAllFiles(wrk *Worker, totalFiles int) bool {
 
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(idx, fileIndex int) {
+		go func(fileIndex int) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -509,16 +549,10 @@ func uploadAllFiles(wrk *Worker, totalFiles int) bool {
 			wrk.uploadedBytes.Add(file.Length)
 			done := completed.Add(1)
 			wrk.reportUploadProgress(totalFiles, int(done))
-		}(idx, fileIndex)
+		}(fileIndex)
 	}
 	wg.Wait()
-
-	if firstErr != nil {
-		errstr := fmt.Sprintf("Ошибка выгрузки файла в телеграм: %v\n\n%v", firstErrFile, firstErr.Error())
-		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
-		return true
-	}
-	return false
+	return firstErr, firstErrFile
 }
 
 // reportUploadProgress обновляет статус-сообщение совокупным прогрессом
@@ -769,7 +803,7 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 		if oversized {
 			fallback = buildLargeFileFallback()
 		}
-		return AudioProcessor(wrk.c, diskPath, wrk.torrentHash, wrk.tmpDir, oversized, fallback)
+		return AudioProcessor(wrk.c, diskPath, wrk.torrentHash, wrk.tmpDir, file.Id, oversized, fallback)
 	}
 
 	fileReader, err := os.Open(diskPath)

@@ -1,6 +1,7 @@
 package tgbot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -15,6 +16,7 @@ import (
 	tele "gopkg.in/telebot.v4"
 	"torrsru/global"
 	"torrsru/tgbot/torr"
+	"torrsru/tgbot/userbot"
 )
 
 func Start(token, host string) error {
@@ -196,6 +198,19 @@ func Start(token, host string) error {
 	}
 
 	torr.Start()
+	// Юзербот (MTProto, см. tgbot/userbot) — второй, отдельный Telegram-
+	// аккаунт для доставки FLAC без перекодирования в M4A (Bot API для
+	// sendAudio принимает только .mp3/.m4a). Не блокирует и не мешает
+	// работе, если не сконфигурирован (нет API_ID/API_HASH в окружении)
+	// или сессия ещё не авторизована — тогда просто логирует это, и весь
+	// FLAC продолжает идти прежним путём (см. trySendFlacViaUserbot в
+	// tgbot/audio.go). Username бота нужен юзерботу один раз — добавить
+	// его в служебную релей-группу (см. tgbot/userbot/relay.go).
+	var botUsername string
+	if b.Me != nil {
+		botUsername = b.Me.Username
+	}
+	userbot.Start(context.Background(), botUsername)
 	go b.Start()
 	return nil
 }

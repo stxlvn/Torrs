@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
@@ -18,7 +19,9 @@ import (
 
 	"github.com/dhowden/tag"
 	tele "gopkg.in/telebot.v4"
+	"torrsru/db"
 	"torrsru/tgbot/torr"
+	"torrsru/tgbot/userbot"
 )
 
 // PendingCover описывает состояние выбора обложки для ОДНОЙ ПАПКИ торрента.
@@ -36,6 +39,7 @@ type queuedTrack struct {
 	Artist   string
 	Title    string
 	Duration int
+	CacheKey string // db.SaveTGFileID ключ, см. audioCacheKey
 }
 
 type PendingCover struct {
@@ -182,7 +186,7 @@ func completeAudioTask(rootTmp string) {
 // разобрался/пользователь отказался), файл всё равно превышает лимит
 // одиночной отправки, и нужно откатиться на fallback (7z-архивация через
 // LargeFileProcessor). Когда oversized=false, fallback всегда nil.
-func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp string, oversized bool, fallback func() error) error {
+func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp string, fileID int, oversized bool, fallback func() error) error {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	if ext != ".mp3" && ext != ".flac" && ext != ".m4a" && ext != ".ogg" {
 		// Задача была зарегистрирована manager'ом до вызова — закрываем,
@@ -201,7 +205,7 @@ func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp stri
 	// этому файлу.
 	if ext == ".flac" {
 		for _, cuePath := range findSiblingCueFiles(filePath) {
-			handled, err := offerCueSplit(c, filePath, cuePath, hash, rootTmp, oversized, fallback)
+			handled, err := offerCueSplit(c, filePath, cuePath, hash, rootTmp, fileID, oversized, fallback)
 			if handled {
 				return err
 			}
@@ -223,20 +227,42 @@ func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp stri
 		return err
 	}
 
-	return processAudioFileNormally(c, filePath, hash, rootTmp)
+	return processAudioFileNormally(c, filePath, hash, rootTmp, fileID)
+}
+
+// audioCacheKey — ключ кэша Telegram file_id (db.SaveTGFileID/GetTGFileID)
+// для целого файла. Формат совпадает с тем, что уже использует
+// tgbot/torr/manager.go (sendWithRetry/sendCachedFile) — единое пространство
+// ключей, чтобы кэш, заполненный одним путём отправки (обычным файлом), был
+// виден и другому (через AudioProcessor), и наоборот.
+func audioCacheKey(hash string, fileID int) string {
+	return fmt.Sprintf("%s|%d", hash, fileID)
 }
 
 // processAudioFileNormally — путь одиночного трека (без нарезки по cue):
 // конвертация FLAC->M4A, определение обложки, отправка. Вызывается как из
 // ProcessAudioFile напрямую (cue не найден), так и из
 // handleCueSplitDecline, когда пользователь отказался от нарезки.
-func processAudioFileNormally(c tele.Context, filePath string, hash string, rootTmp string) error {
+func processAudioFileNormally(c tele.Context, filePath string, hash string, rootTmp string, fileID int) error {
 	ext := strings.ToLower(filepath.Ext(filePath))
+
+	cacheKey := audioCacheKey(hash, fileID)
 
 	// Проверяем вшитую обложку в ИСХОДНОМ файле — до конвертации,
 	// потому что convertToM4A (-vn) выбрасывает встроенную картинку.
 	artist, title, duration, hasCover, coverData := readAudioInfo(filePath)
 	log.Printf("[audio] %s: artist=%q title=%q duration=%v hasCover=%v coverBytes=%d", filePath, artist, title, duration, hasCover, len(coverData))
+
+	// Юзербот (MTProto, см. tgbot/userbot) отправляет ОРИГИНАЛЬНЫЙ FLAC без
+	// перекодирования — Bot API для sendAudio принимает только .mp3/.m4a,
+	// поэтому этот путь пробуем ДО convertToM4A. Если юзербот недоступен
+	// (не поднят) или пользователь ещё не писал ему первым (обязательное
+	// условие Telegram — юзербот не может написать первым), молча
+	// откатываемся на прежний путь ниже.
+	if ext == ".flac" && trySendFlacViaUserbot(c, filePath, artist, title, duration, cacheKey) {
+		completeAudioTask(rootTmp)
+		return nil
+	}
 
 	converted := false
 	if ext == ".flac" {
@@ -259,7 +285,7 @@ func processAudioFileNormally(c tele.Context, filePath string, hash string, root
 	// (конвертация её удалила), для остальных — только готовим превью.
 	if hasCover && len(coverData) > 0 {
 		log.Printf("[audio] %s: обложка уже вшита, отправляем без выбора (converted=%v)", filePath, converted)
-		err := sendWithEmbeddedCover(c, filePath, artist, title, duration, coverData, converted)
+		err := sendWithEmbeddedCover(c, filePath, artist, title, duration, coverData, converted, cacheKey)
 		if err != nil {
 			log.Printf("[audio] %s: sendWithEmbeddedCover ошибка: %v", filePath, err)
 		}
@@ -272,7 +298,7 @@ func processAudioFileNormally(c tele.Context, filePath string, hash string, root
 	dirHash := fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(audioDir)))
 	key := fmt.Sprintf("%d_%s_%s", chatID, hash, dirHash)
 
-	track := queuedTrack{Path: filePath, Artist: artist, Title: title, Duration: duration}
+	track := queuedTrack{Path: filePath, Artist: artist, Title: title, Duration: duration, CacheKey: cacheKey}
 
 	if val, ok := pendingCovers.Load(key); ok {
 		pc := val.(*PendingCover)
@@ -330,9 +356,9 @@ func finishAudioProcessing(c tele.Context, pc *PendingCover, track queuedTrack, 
 	pc.mu.Unlock()
 
 	if selected != "" {
-		err = applyCoverToFile(c, pc, track.Path, selected, track.Artist, track.Title, track.Duration)
+		err = applyCoverToFile(c, pc, track.Path, selected, track.Artist, track.Title, track.Duration, track.CacheKey)
 	} else {
-		err = sendAudio(c, track.Path, track.Artist, track.Title, track.Duration, nil)
+		err = sendAudio(c, track.Path, track.Artist, track.Title, track.Duration, nil, track.CacheKey)
 	}
 	completeAudioTask(rootTmp)
 	return err
@@ -341,18 +367,18 @@ func finishAudioProcessing(c tele.Context, pc *PendingCover, track queuedTrack, 
 // sendWithEmbeddedCover отправляет трек, у которого обложка уже была вшита
 // в исходный файл. reembed=true означает, что файл был сконвертирован
 // (FLAC -> M4A) и обложку нужно вшить заново, т.к. конвертация её удалила.
-func sendWithEmbeddedCover(c tele.Context, filePath, artist, title string, duration int, coverData []byte, reembed bool) error {
+func sendWithEmbeddedCover(c tele.Context, filePath, artist, title string, duration int, coverData []byte, reembed bool, cacheKey string) error {
 	coverPath, err := saveCoverDataToTemp(coverData)
 	if err != nil {
 		// Не смогли сохранить картинку во временный файл — отправляем
 		// без превью (в не-сконвертированном файле обложка и так внутри).
-		return sendAudio(c, filePath, artist, title, duration, nil)
+		return sendAudio(c, filePath, artist, title, duration, nil, cacheKey)
 	}
 	defer os.Remove(coverPath)
 
 	if reembed {
 		// applyCoverToFile сам сожмёт до ≤200 КБ, вошьёт и подставит превью.
-		return applyCoverToFile(c, nil, filePath, coverPath, artist, title, duration)
+		return applyCoverToFile(c, nil, filePath, coverPath, artist, title, duration, cacheKey)
 	}
 
 	// Обложка уже внутри файла — готовим только превью ≤200 КБ.
@@ -363,7 +389,7 @@ func sendWithEmbeddedCover(c tele.Context, filePath, artist, title string, durat
 	} else if len(coverData) <= 200*1024 {
 		thumb = coverData
 	}
-	return sendAudio(c, filePath, artist, title, duration, thumb)
+	return sendAudio(c, filePath, artist, title, duration, thumb, cacheKey)
 }
 
 // saveCoverDataToTemp сохраняет байты вшитой обложки во временный файл с
@@ -614,6 +640,37 @@ func compressCoverForEmbed(coverPath string) (string, error) {
 	return "", fmt.Errorf("не удалось сжать обложку")
 }
 
+// trySendFlacViaUserbot пытается доставить FLAC без перекодирования: юзербот
+// (MTProto) заливает файл в служебную релей-группу, а бот (Bot API)
+// копирует сообщение оттуда в чат с пользователем — см. package-level
+// комментарий tgbot/userbot/client.go про то, почему напрямую пользователю
+// написать нельзя. Возвращает false в любом случае, когда трек нужно
+// отправлять обычным путём (юзербот/релей не готовы либо сама отправка не
+// удалась) — вызывающая сторона тогда продолжает как раньше (convertToM4A +
+// Bot API).
+func trySendFlacViaUserbot(c tele.Context, filePath, artist, title string, duration int, cacheKey string) bool {
+	if !userbot.Ready() {
+		return false
+	}
+
+	thumb := cueAlbumCover(filePath)
+	msgID, chatID, err := userbot.SendToRelay(context.Background(), filePath, title, artist, duration, thumb)
+	if err != nil {
+		log.Printf("[audio] %s: userbot.SendToRelay ошибка, откат на Bot API: %v", filePath, err)
+		return false
+	}
+	sent, err := c.Bot().Copy(c.Recipient(), tele.StoredMessage{MessageID: strconv.Itoa(msgID), ChatID: chatID})
+	if err != nil {
+		log.Printf("[audio] %s: копирование из релея не удалось, откат на Bot API: %v", filePath, err)
+		return false
+	}
+	if cacheKey != "" && sent != nil && sent.Audio != nil && sent.Audio.FileID != "" {
+		db.SaveTGFileID(cacheKey, sent.Audio.FileID)
+	}
+	log.Printf("[audio] %s: отправлено через userbot+релей (MTProto, оригинальный FLAC, без конвертации)", filePath)
+	return true
+}
+
 // maxAudioSendRetries — сколько раз повторить отправку трека при сетевой
 // ошибке (в т.ч. EOF от локального Bot API сервера). Раньше отправка была
 // одноразовой: в отличие от обычных файлов (см. sendWithRetry в
@@ -622,7 +679,7 @@ func compressCoverForEmbed(coverPath string) (string, error) {
 // уже готовый к отправке файл в постоянную ошибку выгрузки.
 const maxAudioSendRetries = 5
 
-func sendAudio(c tele.Context, filePath, artist, title string, duration int, coverData []byte) error {
+func sendAudio(c tele.Context, filePath, artist, title string, duration int, coverData []byte, cacheKey string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -669,6 +726,9 @@ func sendAudio(c tele.Context, filePath, artist, title string, duration int, cov
 		_, sendErr = c.Bot().Send(c.Recipient(), audio)
 		if sendErr == nil {
 			log.Printf("[audio] sendAudio %s: OK after %v (попытка %d/%d)", filePath, time.Since(start), attempt, maxAudioSendRetries)
+			if cacheKey != "" && audio.FileID != "" {
+				db.SaveTGFileID(cacheKey, audio.FileID)
+			}
 			return nil
 		}
 
@@ -717,7 +777,7 @@ func findImagesInDir(dir string) []string {
 // (папку) через getCompressedCoverBytes и переиспользуется для всех треков.
 // pc может быть nil (одиночный трек с уже вшитой обложкой, вне потока выбора
 // обложки папки) — тогда сжатие просто не кэшируется.
-func applyCoverToFile(c tele.Context, pc *PendingCover, audioPath, coverPath, artist, title string, duration int) error {
+func applyCoverToFile(c tele.Context, pc *PendingCover, audioPath, coverPath, artist, title string, duration int, cacheKey string) error {
 	var coverBytes []byte
 	var err error
 	if pc != nil {
@@ -729,13 +789,13 @@ func applyCoverToFile(c tele.Context, pc *PendingCover, audioPath, coverPath, ar
 		if err != nil {
 			log.Printf("[audio] %s: обложка недоступна (%v), отправляем без обложки", audioPath, err)
 		}
-		return sendAudio(c, audioPath, artist, title, duration, nil)
+		return sendAudio(c, audioPath, artist, title, duration, nil, cacheKey)
 	}
 
 	tmpCover, err := writeTempCoverFile(coverBytes)
 	if err != nil {
 		log.Printf("[audio] %s: не удалось записать временный файл обложки (%v), отправляем без обложки", audioPath, err)
-		return sendAudio(c, audioPath, artist, title, duration, nil)
+		return sendAudio(c, audioPath, artist, title, duration, nil, cacheKey)
 	}
 	defer os.Remove(tmpCover)
 
@@ -743,7 +803,7 @@ func applyCoverToFile(c tele.Context, pc *PendingCover, audioPath, coverPath, ar
 		return c.Send("⚠️ Не удалось записать теги: " + err.Error())
 	}
 
-	return sendAudio(c, audioPath, artist, title, duration, coverBytes)
+	return sendAudio(c, audioPath, artist, title, duration, coverBytes, cacheKey)
 }
 
 // writeTempCoverFile сохраняет уже сжатые байты обложки во временный jpg —
@@ -839,7 +899,7 @@ func handleCoverSkip(c tele.Context, hash, dirHash string) error {
 
 	var lastErr error
 	for _, track := range paths {
-		if err := sendAudio(c, track.Path, track.Artist, track.Title, track.Duration, nil); err != nil {
+		if err := sendAudio(c, track.Path, track.Artist, track.Title, track.Duration, nil, track.CacheKey); err != nil {
 			lastErr = err
 		}
 		completeAudioTask(pc.RootTmp)
@@ -874,7 +934,7 @@ func handleCoverSelection(c tele.Context, hash string, imgIndex int, dirHash str
 
 	var lastErr error
 	for _, track := range paths {
-		if err := applyCoverToFile(c, pc, track.Path, coverPath, track.Artist, track.Title, track.Duration); err != nil {
+		if err := applyCoverToFile(c, pc, track.Path, coverPath, track.Artist, track.Title, track.Duration, track.CacheKey); err != nil {
 			lastErr = err
 		}
 		completeAudioTask(pc.RootTmp)
@@ -939,7 +999,7 @@ func handleCustomCoverUpload(c tele.Context, hash, dirHash string, msg *tele.Mes
 
 	var lastErr error
 	for _, track := range paths {
-		if e := applyCoverToFile(c, pc, track.Path, tmpPath, track.Artist, track.Title, track.Duration); e != nil {
+		if e := applyCoverToFile(c, pc, track.Path, tmpPath, track.Artist, track.Title, track.Duration, track.CacheKey); e != nil {
 			lastErr = e
 		}
 		completeAudioTask(pc.RootTmp)

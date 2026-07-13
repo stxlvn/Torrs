@@ -27,3 +27,5 @@ go.work
 /tgbotapi/
 .env
 torrs_bot
+/userbot-login
+/userbot.session*

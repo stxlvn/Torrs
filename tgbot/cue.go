@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -17,6 +18,9 @@ import (
 
 	"golang.org/x/text/encoding/charmap"
 	tele "gopkg.in/telebot.v4"
+
+	"torrsru/db"
+	"torrsru/tgbot/userbot"
 )
 
 // CueTrack — один трек из секции cue-sheet: номер, теги и стартовая позиция
@@ -223,6 +227,7 @@ type PendingCueSplit struct {
 	Tracks         []CueTrack
 	AlbumPerformer string // fallback-исполнитель для треков без своего PERFORMER
 	Hash           string
+	FileID         int // id исходного файла в торренте — для ключа кэша file_id per-трек
 	RootTmp        string
 	PickerMsg      *tele.Message
 
@@ -268,7 +273,7 @@ func findSiblingCueFiles(audioPath string) []string {
 // разобрался/не описывает этот файл/содержит для него меньше 2 треков:
 // вызывающий код должен попробовать следующий .cue из папки (если есть) или
 // обработать файл как обычный одиночный трек.
-func offerCueSplit(c tele.Context, audioPath, cuePath, hash, rootTmp string, oversized bool, fallback func() error) (handled bool, err error) {
+func offerCueSplit(c tele.Context, audioPath, cuePath, hash, rootTmp string, fileID int, oversized bool, fallback func() error) (handled bool, err error) {
 	data, err := os.ReadFile(cuePath)
 	if err != nil {
 		log.Printf("[cue] %s: не удалось прочитать %s: %v", audioPath, cuePath, err)
@@ -302,6 +307,7 @@ func offerCueSplit(c tele.Context, audioPath, cuePath, hash, rootTmp string, ove
 		Tracks:         section.Tracks,
 		AlbumPerformer: sheet.Performer,
 		Hash:           hash,
+		FileID:         fileID,
 		RootTmp:        rootTmp,
 		Oversized:      oversized,
 		Fallback:       fallback,
@@ -370,7 +376,7 @@ func handleCueSplitDecline(c tele.Context, hash, fileHash string) error {
 	}
 
 	c.Respond(&tele.CallbackResponse{Text: "Отправляю как есть"})
-	return processAudioFileNormally(c, pcs.AudioPath, pcs.Hash, pcs.RootTmp)
+	return processAudioFileNormally(c, pcs.AudioPath, pcs.Hash, pcs.RootTmp, pcs.FileID)
 }
 
 // handleCueSplitConfirm — пользователь подтвердил нарезку.
@@ -422,12 +428,24 @@ func cueAlbumCover(audioPath string) []byte {
 }
 
 // performCueSplit нарезает исходный файл на треки по секции cue-sheet и
-// отправляет каждый через sendAudio. Конец трека — это начало следующего (в
-// пределах ТОЙ ЖЕ секции/файла) или конец файла для последнего; INDEX 00
-// (пре-гэп) уже отброшен на этапе разбора.
+// отправляет каждый. Конец трека — это начало следующего (в пределах ТОЙ ЖЕ
+// секции/файла) или конец файла для последнего; INDEX 00 (пре-гэп) уже
+// отброшен на этапе разбора.
+//
+// Юзербот (MTProto) или Bot API выбирается ОДИН раз на весь альбом (а не
+// решается заново для каждого трека) — тайминги и решение по обложке не
+// зависят от трека, и это же убирает частичные состояния вроде "половина
+// треков ушла через юзербота, половина как FLAC-документ через Bot API",
+// если пользователь окажется непривязан именно в середине нарезки.
 func performCueSplit(c tele.Context, pcs *PendingCueSplit) error {
 	totalDur := time.Duration(getDurationFFprobe(pcs.AudioPath)) * time.Second
 	coverData := cueAlbumCover(pcs.AudioPath)
+
+	useUserbot := userbot.Ready()
+	outExt, codec := ".m4a", "alac"
+	if useUserbot {
+		outExt, codec = ".flac", "flac"
+	}
 
 	var lastErr error
 	for i, tr := range pcs.Tracks {
@@ -449,14 +467,47 @@ func performCueSplit(c tele.Context, pcs *PendingCueSplit) error {
 			title = fmt.Sprintf("Track %d", tr.Number)
 		}
 
-		outPath, err := cutCueTrack(pcs.AudioPath, tr.Start, end, tr.Number)
+		// Ключ — по исходному файлу И номеру трека внутри него: один и тот
+		// же торрент-файл режется на несколько сообщений, у каждого свой
+		// закэшированный file_id (см. audioCacheKey в tgbot/audio.go).
+		trackCacheKey := fmt.Sprintf("%s#%d", audioCacheKey(pcs.Hash, pcs.FileID), tr.Number)
+		if tgfid := db.GetTGFileID(trackCacheKey); tgfid != "" {
+			if err := sendCachedAudio(c, tgfid, title, performer); err != nil {
+				log.Printf("[cue] %s: трек %d не отправлен из кэша: %v", pcs.AudioPath, tr.Number, err)
+				lastErr = err
+			} else {
+				log.Printf("[cue] %s: трек %d отправлен из кэша Telegram (file_id)", pcs.AudioPath, tr.Number)
+			}
+			continue
+		}
+
+		durSecs := int((end - tr.Start).Seconds())
+
+		outPath, err := cutCueTrack(pcs.AudioPath, tr.Start, end, tr.Number, outExt, codec)
 		if err != nil {
 			log.Printf("[cue] %s: не удалось нарезать трек %d (%v–%v): %v", pcs.AudioPath, tr.Number, tr.Start, end, err)
 			lastErr = err
 			continue
 		}
 
-		if err := sendAudio(c, outPath, performer, title, int((end-tr.Start).Seconds()), coverData); err != nil {
+		if useUserbot {
+			msgID, chatID, err := userbot.SendToRelay(context.Background(), outPath, title, performer, durSecs, coverData)
+			var sent *tele.Message
+			if err == nil {
+				sent, err = c.Bot().Copy(c.Recipient(), tele.StoredMessage{MessageID: strconv.Itoa(msgID), ChatID: chatID})
+			}
+			if err != nil {
+				log.Printf("[cue] %s: трек %d не отправлен через userbot: %v", pcs.AudioPath, tr.Number, err)
+				lastErr = err
+				continue
+			}
+			if sent != nil && sent.Audio != nil && sent.Audio.FileID != "" {
+				db.SaveTGFileID(trackCacheKey, sent.Audio.FileID)
+			}
+			continue
+		}
+
+		if err := sendAudio(c, outPath, performer, title, durSecs, coverData, trackCacheKey); err != nil {
 			log.Printf("[cue] %s: трек %d не отправлен: %v", pcs.AudioPath, tr.Number, err)
 			lastErr = err
 		}
@@ -464,29 +515,45 @@ func performCueSplit(c tele.Context, pcs *PendingCueSplit) error {
 	return lastErr
 }
 
-// cutCueTrack вырезает [start, end) из srcPath и перекодирует в ALAC/M4A —
-// как и одиночные FLAC (см. convertToM4A), т.к. Bot API принимает для
-// sendAudio только .mp3/.m4a. -ss ДО -i даёт быстрый seek по входному
-// файлу; -to при этом трактуется как абсолютная позиция в исходном
-// таймлайне (а не относительно точки seek), что и нужно — Start/End уже
-// абсолютные тайминги внутри СВОЕГО файла из cue-sheet. trackNum входит в
-// имя выходного файла, а не в порядковый номер внутри секции, поэтому имена
-// разных файлов одной папки (см. CueFileSection) не конфликтуют между
-// собой только благодаря тому, что резка каждого файла идёт в его же
-// каталоге — collision тут невозможен, т.к. номера треков в cue уникальны
-// по всему документу (see TRACK NN сквозная нумерация в примере ICE MC).
-func cutCueTrack(srcPath string, start, end time.Duration, trackNum int) (string, error) {
-	outPath := filepath.Join(filepath.Dir(srcPath), fmt.Sprintf("cue_track_%02d.m4a", trackNum))
+// sendCachedAudio пересылает уже когда-то отправленный трек по
+// закэшированному Telegram file_id — без повторного скачивания/нарезки/
+// заливки (см. db.SaveTGFileID/GetTGFileID и trackCacheKey в
+// performCueSplit).
+func sendCachedAudio(c tele.Context, fileID, title, performer string) error {
+	audio := &tele.Audio{File: tele.File{FileID: fileID}, Title: title, Performer: performer}
+	_, err := c.Bot().Send(c.Recipient(), audio)
+	return err
+}
+
+// cutCueTrack вырезает [start, end) из srcPath и перекодирует в формат под
+// целевой канал доставки: FLAC (без потерь, для юзербота/MTProto) либо
+// ALAC/M4A (для Bot API — sendAudio принимает только .mp3/.m4a). Оба —
+// lossless-кодеки, разница только в контейнере/совместимости с получателем.
+// -ss ДО -i даёt быстрый seek по входному файлу; -to при этом трактуется как
+// абсолютная позиция в исходном таймлайне (а не относительно точки seek),
+// что и нужно — Start/End уже абсолютные тайминги внутри СВОЕГО файла из
+// cue-sheet. trackNum входит в имя выходного файла, а не в порядковый номер
+// внутри секции, поэтому имена разных файлов одной папки (см.
+// CueFileSection) не конфликтуют между собой только благодаря тому, что
+// резка каждого файла идёт в его же каталоге — collision тут невозможен,
+// т.к. номера треков в cue уникальны по всему документу (см. сквозную
+// нумерацию TRACK NN в примере ICE MC).
+func cutCueTrack(srcPath string, start, end time.Duration, trackNum int, outExt, codec string) (string, error) {
+	outPath := filepath.Join(filepath.Dir(srcPath), fmt.Sprintf("cue_track_%02d%s", trackNum, outExt))
 	args := []string{
 		"-ss", formatFFmpegTime(start),
 		"-to", formatFFmpegTime(end),
 		"-i", srcPath,
 		"-map", "0:a",
-		"-c:a", "alac",
-		"-movflags", "+faststart",
-		"-vn",
-		outPath,
+		"-c:a", codec,
 	}
+	if codec == "alac" {
+		// movflags актуален только для MOV/MP4-контейнера (.m4a); для
+		// нативного FLAC-контейнера ffmpeg эту опцию не понимает.
+		args = append(args, "-movflags", "+faststart")
+	}
+	args = append(args, "-vn", outPath)
+
 	start2 := time.Now()
 	cmd := exec.Command("ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
