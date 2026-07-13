@@ -2,13 +2,10 @@ package torr
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -92,44 +89,3 @@ func truncate(b []byte, n int) string {
 	return string(b[:n]) + "..."
 }
 
-// DownloadTorrentFile скачивает конкретный файл из торрента (по индексу в FileStats) и сохраняет во временный файл.
-// Возвращает путь к временному файлу. Вызывающая сторона обязана удалить файл после использования.
-func DownloadTorrentFile(hash string, fileIndex int) (string, error) {
-	ti, err := GetTorrentInfo(hash)
-	if err != nil {
-		log.Printf("[torrent] DownloadTorrentFile(%s, %d): GetTorrentInfo FAILED: %v", hash, fileIndex, err)
-		return "", err
-	}
-	if fileIndex < 0 || fileIndex >= len(ti.FileStats) {
-		log.Printf("[torrent] DownloadTorrentFile(%s, %d): неверный индекс (всего файлов %d)", hash, fileIndex, len(ti.FileStats))
-		return "", errors.New("неверный индекс файла")
-	}
-	fileStat := ti.FileStats[fileIndex]
-
-	// Создаём временный Worker только для загрузки одного файла
-	wrk := &Worker{
-		torrentHash: hash,
-	}
-
-	tf, err := NewTorrFile(wrk, fileStat)
-	if err != nil {
-		log.Printf("[torrent] DownloadTorrentFile(%s, %d): NewTorrFile FAILED: %v", hash, fileIndex, err)
-		return "", err
-	}
-	defer tf.Close()
-
-	tmpFile, err := os.CreateTemp("", "torrimg_*"+filepath.Ext(fileStat.Path))
-	if err != nil {
-		return "", err
-	}
-	defer tmpFile.Close()
-
-	_, err = io.Copy(tmpFile, tf)
-	if err != nil {
-		log.Printf("[torrent] DownloadTorrentFile(%s, %d): копирование FAILED: %v", hash, fileIndex, err)
-		os.Remove(tmpFile.Name())
-		return "", err
-	}
-	log.Printf("[torrent] DownloadTorrentFile(%s, %d): OK -> %s", hash, fileIndex, tmpFile.Name())
-	return tmpFile.Name(), nil
-}

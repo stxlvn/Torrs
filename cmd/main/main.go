@@ -8,18 +8,14 @@ import (
 	"torrsru/db"
 	"torrsru/global"
 	"torrsru/tgbot"
-	"torrsru/web"
 )
 
 func main() {
 	var args struct {
-		Port         string `default:"8094" arg:"-p" help:"port for http"`
-		RebuildIndex bool   `default:"false" arg:"-r" help:"rebuild index and exit"`
-		TMDBProxy    bool   `default:"false" arg:"--tmdb" help:"proxy for TMDB"`
-		TGBotToken   string `arg:"--token" help:"telegram bot token"`
-		TGHost       string `default:"http://127.0.0.1:8082" arg:"--tgapi" help:"local telegram api host"`
-		TGFilesDir   string `default:"/tmp/telegram-bot-files" arg:"--tgfiles" help:"local telegram-bot-api file storage dir (fallback when its HTTP /file/ download is unavailable)"`
-		TSHost       string `default:"http://127.0.0.1:8090" arg:"--ts" help:"TorrServer host"`
+		TGBotToken string `arg:"--token" help:"telegram bot token"`
+		TGHost     string `default:"http://127.0.0.1:8082" arg:"--tgapi" help:"local telegram api host"`
+		TGFilesDir string `default:"/tmp/telegram-bot-files" arg:"--tgfiles" help:"local telegram-bot-api file storage dir (fallback when its HTTP /file/ download is unavailable)"`
+		TSHost     string `default:"http://127.0.0.1:8090" arg:"--ts" help:"TorrServer host"`
 	}
 	arg.MustParse(&args)
 
@@ -33,18 +29,10 @@ func main() {
 	log.Println("PWD:", pwd)
 	global.PWD = pwd
 
-	global.TMDBProxy = args.TMDBProxy
 	global.TSHost = args.TSHost
 	global.TGFilesDir = args.TGFilesDir
 
 	db.Init()
-
-	if args.RebuildIndex {
-		if err := db.RebuildIndex(); err != nil {
-			log.Println("Rebuild index error:", err)
-		}
-		return
-	}
 
 	if args.TGBotToken != "" {
 		log.Printf("Запуск бота через локальный API: %s\n", args.TGHost)
@@ -53,8 +41,6 @@ func main() {
 		}
 	}
 
-	go web.Start(args.Port)
-
-	// Блокируем выход, чтобы горутины бота и веба работали вечно
+	// Блокируем выход, чтобы горутины бота работали вечно
 	select {}
 }

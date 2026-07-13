@@ -31,9 +31,8 @@ import (
 )
 
 var (
-	client   *telegram.Client
-	ready    atomic.Bool
-	username atomic.Value // string
+	client *telegram.Client
+	ready  atomic.Bool
 )
 
 // Ready сообщает, авторизован ли юзербот, поднято ли MTProto-соединение и
@@ -42,13 +41,6 @@ var (
 // ловить ошибку) и откатываться на старый путь через Bot API.
 func Ready() bool {
 	return ready.Load() && RelayChatID() != 0
-}
-
-// Username возвращает @username юзербота (без @), если он известен.
-// Пустая строка, если юзербот ещё не подключался.
-func Username() string {
-	v, _ := username.Load().(string)
-	return v
 }
 
 // SessionPath возвращает путь к файлу сессии — тот же, что использует
@@ -103,7 +95,6 @@ func runForever(ctx context.Context, c *telegram.Client, botUsername string) {
 				return err
 			}
 			log.Printf("[userbot] подключено: @%s (id=%d)", self.Username, self.ID)
-			username.Store(self.Username)
 
 			if err := ensureRelayChannel(ctx, c.API(), botUsername); err != nil {
 				// Не фатально для соединения — просто фича остаётся

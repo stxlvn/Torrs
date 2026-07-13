@@ -12,9 +12,7 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
-	initdata "github.com/telegram-mini-apps/init-data-golang"
 	tele "gopkg.in/telebot.v4"
-	"torrsru/global"
 	"torrsru/tgbot/torr"
 	"torrsru/tgbot/userbot"
 )
@@ -106,7 +104,7 @@ func Start(token, host string) error {
 			}
 			return nil
 		} else {
-			return c.Send("Вставьте магнет/хэш торрента или нажмите на поиск\n\nВ окне поиска введите название и в списке торрентов нажмите на +\n\nУчтите что файл не должен превышать 2гб это лимит телеграмма на отправку файлов")
+			return c.Send("Вставьте магнет-ссылку, хеш торрента или отправьте .torrent файл\n\nУчтите, что файл не должен превышать 2 ГБ — это лимит self-hosted Bot API сервера на отправку файлов")
 		}
 	})
 
@@ -162,40 +160,6 @@ func Start(token, host string) error {
 		log.Printf("[bot] callback без аргументов от user=%d", c.Sender().ID)
 		return errors.New("Ошибка кнопка не распознана")
 	})
-
-	global.SendFromWeb = func(initDataUser, msg string) error {
-		err := initdata.Validate(initDataUser, token, time.Duration(0))
-		if err != nil {
-			return errors.New("Error auth user")
-		}
-		data, err := initdata.Parse(initDataUser)
-		if err != nil {
-			return errors.New("Error parse user data")
-		}
-		chat, err := b.ChatByID(data.User.ID)
-		if err != nil {
-			return errors.New("Chat with user not found")
-		}
-		u := tele.Update{
-			Message: &tele.Message{
-				Sender: &tele.User{
-					ID:           data.User.ID,
-					FirstName:    data.User.FirstName,
-					LastName:     data.User.LastName,
-					Username:     data.User.Username,
-					LanguageCode: data.User.LanguageCode,
-					IsBot:        data.User.IsBot,
-					IsPremium:    data.User.IsPremium,
-					AddedToMenu:  data.User.AddedToAttachmentMenu,
-				},
-				Unixtime: time.Now().Unix(),
-				Chat:     chat,
-				Text:     msg,
-			},
-		}
-		c := b.NewContext(u)
-		return infoTorrent(c, msg)
-	}
 
 	torr.Start()
 	// Юзербот (MTProto, см. tgbot/userbot) — второй, отдельный Telegram-
