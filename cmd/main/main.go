@@ -37,7 +37,13 @@ func main() {
 	if args.TGBotToken != "" {
 		log.Printf("Запуск бота через локальный API: %s\n", args.TGHost)
 		if err := tgbot.Start(args.TGBotToken, args.TGHost); err != nil {
-			log.Println("Ошибка старта Telegram бота:", err)
+			// Раньше ошибка тут просто логировалась, а процесс уходил в
+			// select{} навсегда — если локальный telegram-bot-api ещё не
+			// поднялся (например, гонка при загрузке сервера), бот молча
+			// зависал без polling'а до ручного перезапуска. Падаем с
+			// ошибкой, чтобы systemd (Restart=always, RestartSec=5) сам
+			// повторял попытки, пока API не станет доступен.
+			log.Fatalln("Ошибка старта Telegram бота:", err)
 		}
 	}
 
