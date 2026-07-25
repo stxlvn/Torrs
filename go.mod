@@ -9,7 +9,9 @@ require (
 	github.com/dustin/go-humanize v1.0.0
 	github.com/gotd/td v0.160.0
 	go.etcd.io/bbolt v1.3.8
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/text v0.38.0
+	google.golang.org/api v0.288.0
 	gopkg.in/telebot.v4 v4.0.0-beta.4
 )
 
@@ -69,15 +71,12 @@ require (
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
-	google.golang.org/api v0.288.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 // indirect
-	google.golang.org/grpc v1.82.0 // indirect
+	google.golang.org/grpc v1.82.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 	rsc.io/qr v0.2.0 // indirect
