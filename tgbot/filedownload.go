@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tele "gopkg.in/telebot.v4"
 	"torrsru/global"
@@ -49,7 +50,7 @@ func downloadTelegramFile(b tele.API, f *tele.File) (io.ReadCloser, error) {
 	if global.TGFilesDir == "" {
 		return nil, fmt.Errorf("скачивание не удалось: HTTP /file/ недоступен, локальный каталог (--tgfiles) не задан")
 	}
-	localPath := filepath.Join(global.TGFilesDir, botToken, filePath)
+	localPath := filepath.Join(global.TGFilesDir, botToken, relativeToTokenDir(filePath))
 	file, err := os.Open(localPath)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось скачать файл ни по HTTP, ни с локального диска (%s): %w", localPath, err)
@@ -73,4 +74,14 @@ func resolveFilePath(b tele.API, fileID string) (string, error) {
 		return "", err
 	}
 	return resp.Result.FilePath, nil
+}
+
+// relativeToTokenDir: в режиме --local сервер отдаёт в getFile абсолютный
+// путь внутри своего рабочего каталога (/var/lib/telegram-bot-api/<token>/...),
+// а не относительный — отрезаем всё до каталога токена включительно.
+func relativeToTokenDir(filePath string) string {
+	if i := strings.Index(filePath, "/"+botToken+"/"); i >= 0 {
+		return filePath[i+len(botToken)+2:]
+	}
+	return filePath
 }
