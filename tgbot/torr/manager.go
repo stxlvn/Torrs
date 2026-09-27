@@ -486,7 +486,24 @@ func loading(wrk *Worker) {
 	// когда конвейер сам обработает СЛЕДУЮЩИЙ файл (а для последнего файла
 	// задачи такого следующего вызова уже не будет вовсе, и прогресс так
 	// и останется на "0.00%", несмотря на реально отправленные треки).
+	var lastActivity atomic.Int64
+	touch := func() { lastActivity.Store(time.Now().UnixNano()) }
+	touch()
+	finished := make(chan struct{})
+	var finishOnce sync.Once
+	userOnDone := onDone
+	onDone = func() {
+		userOnDone()
+		finishOnce.Do(func() { close(finished) })
+	}
+	progress := onProgress
+	onProgress = func(text string) {
+		touch()
+		progress(text)
+	}
+
 	onBytes := func(n int64) {
+		touch()
 		wrk.uploadedBytes.Add(n)
 		if pipelineFailed.Load() || wrk.isCancelled.Load() {
 			return
@@ -497,7 +514,7 @@ func loading(wrk *Worker) {
 	hooksReady := RegisterAudioTasks != nil && AddAudioTask != nil && CompleteAudioTask != nil
 	if hooksReady {
 		RegisterAudioTasks(tmpDir, 1, onDone, onBytes, onProgress)
-		defer CompleteAudioTask(tmpDir)
+		defer waitAudioTasks(wrk, tmpDir, finished, &lastActivity)
 	} else {
 		// Хуки не привязаны (аудио-обработка отключена) — папку чистим
 		// сами по завершении, но onDone всё равно должен сработать здесь же
@@ -517,6 +534,34 @@ func loading(wrk *Worker) {
 	iserr := runAllFiles(wrk, totalFiles)
 	if iserr {
 		pipelineFailed.Store(true)
+	}
+}
+
+// audioIdleLimit — сколько очередь ждёт завершения аудио-обработки задачи
+// без какой-либо активности (например, пока пользователь не отвечает на
+// меню обложки/cue), прежде чем отпустить следующую задачу.
+const audioIdleLimit = 20 * time.Minute
+
+// waitAudioTasks закрывает задачу-страж и ждёт, пока реально отправятся все
+// треки: нарезка, конвертация и доставка идут асинхронно после ответа на
+// меню, и без ожидания следующая раздача шла бы вперемешку с этой.
+func waitAudioTasks(wrk *Worker, tmpDir string, finished chan struct{}, lastActivity *atomic.Int64) {
+	CompleteAudioTask(tmpDir)
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-finished:
+			return
+		case <-tick.C:
+			if wrk.isCancelled.Load() {
+				return
+			}
+			if idle := time.Since(time.Unix(0, lastActivity.Load())); idle > audioIdleLimit {
+				log.Printf("[manager] worker=%d: аудио-обработка без активности %v, отпускаю очередь", wrk.id, idle.Round(time.Second))
+				return
+			}
+		}
 	}
 }
 

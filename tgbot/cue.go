@@ -64,6 +64,7 @@ type PendingCueSplit struct {
 	Cuts      []CueCut
 	Source    string
 	PickerMsg *tele.Message
+	group     *PendingCueGroup
 }
 
 type pendingCuelessFile struct {
@@ -88,7 +89,13 @@ type PendingCueGroup struct {
 	PickerMsg *tele.Message
 	Decided   bool
 	Confirmed bool
-	mu        sync.Mutex
+
+	coverAsked   bool
+	coverChosen  bool
+	coverData    []byte
+	coverWaiting []*PendingCueSplit
+
+	mu sync.Mutex
 }
 
 type cueDirInfo struct{ Dir, RootTmp, Hash string }
@@ -631,7 +638,22 @@ func applyCueGroupDecision(c tele.Context, group *PendingCueGroup, f *pendingCue
 	if !confirmed {
 		return proceedAsIs(c, f.ctx, nil)
 	}
-	pcs := &PendingCueSplit{cueFileCtx: f.ctx, Sheet: group.Sheet, Cuts: group.Sheet.Cuts(&group.Sheet.Files[f.Section]), Source: group.Source}
+	pcs := &PendingCueSplit{cueFileCtx: f.ctx, Sheet: group.Sheet, Cuts: group.Sheet.Cuts(&group.Sheet.Files[f.Section]), Source: group.Source, group: group}
+	group.mu.Lock()
+	switch {
+	case group.coverChosen:
+		cover := group.coverData
+		group.mu.Unlock()
+		err := performCueSplitWithCover(c, pcs, cover)
+		completeAudioTask(pcs.RootTmp)
+		return err
+	case group.coverAsked:
+		group.coverWaiting = append(group.coverWaiting, pcs)
+		group.mu.Unlock()
+		return nil
+	}
+	group.coverAsked = true
+	group.mu.Unlock()
 	return offerCueCoverSelection(c, pcs)
 }
 
@@ -858,6 +880,17 @@ func offerCueCoverSelection(c tele.Context, pcs *PendingCueSplit) error {
 		log.Printf("[cue] %s: не удалось показать меню выбора обложки: %v", pcs.AudioPath, err)
 		pendingCovers.Delete(key)
 		completeAudioTask(pcs.RootTmp)
+		if g := pcs.group; g != nil {
+			g.mu.Lock()
+			g.coverChosen = true
+			waiting := g.coverWaiting
+			g.coverWaiting = nil
+			g.mu.Unlock()
+			for _, w := range waiting {
+				performCueSplitWithCover(c, w, nil)
+				completeAudioTask(w.RootTmp)
+			}
+		}
 	}
 	return err
 }
@@ -871,9 +904,23 @@ func finishCueSplit(c tele.Context, pcs *PendingCueSplit, coverPath string) erro
 			log.Printf("[cue] %s: не удалось подготовить обложку (%v), продолжаю без неё", pcs.AudioPath, err)
 		}
 	}
+	var waiting []*PendingCueSplit
+	if g := pcs.group; g != nil {
+		g.mu.Lock()
+		g.coverChosen, g.coverData = true, coverData
+		waiting, g.coverWaiting = g.coverWaiting, nil
+		g.mu.Unlock()
+	}
 	err := performCueSplitWithCover(c, pcs, coverData)
 	if err != nil {
 		log.Printf("[cue] %s: нарезка завершилась с ошибками: %v", pcs.AudioPath, err)
+	}
+	for _, w := range waiting {
+		if werr := performCueSplitWithCover(c, w, coverData); werr != nil {
+			log.Printf("[cue] %s: нарезка завершилась с ошибками: %v", w.AudioPath, werr)
+			err = werr
+		}
+		completeAudioTask(w.RootTmp)
 	}
 	return err
 }
