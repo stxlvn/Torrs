@@ -185,9 +185,16 @@ ArchivingLoop:
 		}
 	}
 
-	matches, err := filepath.Glob(archivePath + ".*")
+	var matches []string
+	entries, err := os.ReadDir(tmpDir)
+	volPrefix := filepath.Base(archivePath) + "."
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), volPrefix) {
+			matches = append(matches, filepath.Join(tmpDir, e.Name()))
+		}
+	}
 	if err != nil || len(matches) == 0 {
-		log.Printf("[largefile] %s: файлы архива не найдены (glob err=%v)", filePath, err)
+		log.Printf("[largefile] %s: файлы архива не найдены (readdir err=%v)", filePath, err)
 		return fmt.Errorf("файлы архива не найдены")
 	}
 
