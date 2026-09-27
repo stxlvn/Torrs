@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/gotd/td/tg"
 
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/unpack"
@@ -73,7 +77,16 @@ func SendToRelay(ctx context.Context, filePath, title, performer string, duratio
 		return 0, 0, fmt.Errorf("userbot: загрузка файла: %w", err)
 	}
 
-	doc := message.UploadedDocument(file).MIME("audio/flac")
+	mime := "audio/flac"
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".m4a", ".mp4":
+		mime = "audio/mp4"
+	case ".mp3":
+		mime = "audio/mpeg"
+	case ".ogg":
+		mime = "audio/ogg"
+	}
+	doc := message.UploadedDocument(file).MIME(mime)
 	if len(thumbData) > 0 {
 		if thumb, err := up.FromBytes(ctx, "cover.jpg", thumbData); err == nil {
 			doc = doc.Thumb(thumb)
@@ -94,4 +107,87 @@ func SendToRelay(ctx context.Context, filePath, title, performer string, duratio
 		return 0, 0, fmt.Errorf("userbot: отправка в релей: %w", err)
 	}
 	return id, RelayChatID(), nil
+}
+
+type RelayAudio struct {
+	Path      string
+	MIME      string
+	Title     string
+	Performer string
+	Duration  int
+	Thumb     []byte
+}
+
+// SendAlbumToRelay заливает до 10 аудио одним альбомом в релей-группу;
+// возвращает id сообщений альбома по порядку — бот копирует их разом
+// (copyMessages сохраняет группировку).
+func SendAlbumToRelay(ctx context.Context, items []RelayAudio) (msgIDs []int, chatID int64, err error) {
+	if !Ready() || client == nil {
+		return nil, 0, ErrNotReady
+	}
+	if len(items) < 2 || len(items) > 10 {
+		return nil, 0, fmt.Errorf("userbot: в альбоме должно быть 2–10 треков, а не %d", len(items))
+	}
+
+	sendMu.Lock()
+	defer sendMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout*time.Duration(len(items)))
+	defer cancel()
+
+	api := client.API()
+	up := uploader.NewUploader(api)
+	var opts []message.MultiMediaOption
+	for _, it := range items {
+		file, err := up.FromPath(ctx, it.Path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("userbot: загрузка %s: %w", filepath.Base(it.Path), err)
+		}
+		doc := message.UploadedDocument(file).MIME(it.MIME)
+		if len(it.Thumb) > 0 {
+			if thumb, err := up.FromBytes(ctx, "cover.jpg", it.Thumb); err == nil {
+				doc = doc.Thumb(thumb)
+			}
+		}
+		opts = append(opts, doc.Audio().
+			Title(it.Title).
+			Performer(it.Performer).
+			DurationSeconds(it.Duration).
+			Filename(filepath.Base(it.Path)))
+	}
+
+	upd, err := message.NewSender(api).To(relayPeer()).Album(ctx, opts[0], opts[1:]...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("userbot: отправка альбома в релей: %w", err)
+	}
+	msgIDs = albumMessageIDs(upd)
+	if len(msgIDs) != len(items) {
+		return nil, 0, fmt.Errorf("userbot: в ответе %d сообщений вместо %d", len(msgIDs), len(items))
+	}
+	return msgIDs, RelayChatID(), nil
+}
+
+func albumMessageIDs(u tg.UpdatesClass) []int {
+	var updates []tg.UpdateClass
+	switch v := u.(type) {
+	case *tg.Updates:
+		updates = v.Updates
+	case *tg.UpdatesCombined:
+		updates = v.Updates
+	}
+	var ids []int
+	for _, up := range updates {
+		var m tg.MessageClass
+		switch x := up.(type) {
+		case *tg.UpdateNewChannelMessage:
+			m = x.Message
+		case *tg.UpdateNewMessage:
+			m = x.Message
+		}
+		if msg, ok := m.(*tg.Message); ok {
+			ids = append(ids, msg.ID)
+		}
+	}
+	sort.Ints(ids)
+	return ids
 }

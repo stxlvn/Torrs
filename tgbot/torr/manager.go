@@ -40,6 +40,7 @@ var (
 	// (включая задачу-страж); PhotoSender отправляет картинки альбомами.
 	AudioTasksPending func(tmpDir string) int64
 	PhotoSender       func(c tele.Context, paths []string) error
+	FlushTracks       func(tmpDir string)
 
 	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string, fileID int, oversized bool, fallback func() error) error
 	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool, kbd *tele.ReplyMarkup) error
@@ -561,6 +562,9 @@ func loading(wrk *Worker) {
 				}
 				time.Sleep(2 * time.Second)
 			}
+			if FlushTracks != nil {
+				FlushTracks(tmpDir)
+			}
 		}
 	}
 	iserr := runAllFiles(wrk, totalFiles, waitAudio)
@@ -578,6 +582,18 @@ const audioIdleLimit = 20 * time.Minute
 // треки: нарезка, конвертация и доставка идут асинхронно после ответа на
 // меню, и без ожидания следующая раздача шла бы вперемешку с этой.
 func waitAudioTasks(wrk *Worker, tmpDir string, finished chan struct{}, lastActivity *atomic.Int64) {
+	if AudioTasksPending != nil {
+		lastActivity.Store(time.Now().UnixNano())
+		for AudioTasksPending(tmpDir) > 1 {
+			if wrk.isCancelled.Load() || time.Since(time.Unix(0, lastActivity.Load())) > audioIdleLimit {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+	if FlushTracks != nil {
+		FlushTracks(tmpDir)
+	}
 	CompleteAudioTask(tmpDir)
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()

@@ -1,7 +1,6 @@
 package tgbot
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -11,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -989,49 +987,25 @@ func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []
 		durSecs := int((stop - cut.Start).Seconds())
 
 		cacheKey := fmt.Sprintf("%s#%d", audioCacheKey(pcs.Hash, pcs.FileID), cut.Number)
+		order := fmt.Sprintf("%s/%05d", filepath.Dir(pcs.AudioPath), cut.Number)
+		group := filepath.Dir(pcs.AudioPath)
 		if tgfid := db.GetTGFileID(cacheKey); tgfid != "" {
-			if err := sendCachedAudio(c, tgfid, cut.Title, cut.Performer); err != nil {
-				log.Printf("[cue] %s: трек %d не отправлен из кэша: %v", pcs.AudioPath, cut.Number, err)
-				lastErr = err
-			}
+			enqueueTrack(c, pcs.RootTmp, group, readyTrack{FileID: tgfid, Title: cut.Title, Performer: cut.Performer, Order: order})
 			continue
 		}
 
 		tags := cueTags(pcs.Sheet, cut)
-		base := filepath.Join(outDir, fmt.Sprintf("%02d. %s", cut.Number, sanitizeFileName(cut.Title)))
-		outPath := base + mode.ext()
+		outPath := filepath.Join(outDir, fmt.Sprintf("%02d. %s", cut.Number, sanitizeFileName(cut.Title))) + mode.ext()
 		if err := transcodeAudio(pcs.AudioPath, outPath, cut.Start, end, probe, mode, tags); err != nil {
 			lastErr = err
 			continue
 		}
-
-		if mode == outFLAC {
-			msgID, chatID, sendErr := userbot.SendToRelay(context.Background(), outPath, cut.Title, cut.Performer, durSecs, coverData)
-			var sent *tele.Message
-			if sendErr == nil {
-				sent, sendErr = c.Bot().Copy(c.Recipient(), tele.StoredMessage{MessageID: strconv.Itoa(msgID), ChatID: chatID})
-			}
-			os.Remove(outPath)
-			if sendErr == nil {
-				if sent != nil && sent.Audio != nil && sent.Audio.FileID != "" {
-					db.SaveTGFileID(cacheKey, sent.Audio.FileID)
-				}
-				continue
-			}
-			log.Printf("[cue] %s: трек %d не отправлен через userbot (%v), откатываюсь на Bot API (ALAC)", pcs.AudioPath, cut.Number, sendErr)
-			outPath = base + outALAC.ext()
-			if err := transcodeAudio(pcs.AudioPath, outPath, cut.Start, end, probe, outALAC, tags); err != nil {
-				lastErr = err
-				continue
-			}
+		if mode != outFLAC {
+			embedCover(outPath, cut.Performer, cut.Title, coverData)
 		}
-		if err := sendAudio(c, outPath, cut.Performer, cut.Title, durSecs, coverData, cacheKey); err != nil {
-			log.Printf("[cue] %s: трек %d не отправлен: %v", pcs.AudioPath, cut.Number, err)
-			lastErr = err
-		}
-		os.Remove(outPath)
+		enqueueTrack(c, pcs.RootTmp, group, readyTrack{Path: outPath, Title: cut.Title, Performer: cut.Performer, Duration: durSecs,
+			Cover: coverData, CacheKey: cacheKey, Order: order, cleanup: []string{outPath}})
 	}
-	os.Remove(outDir)
 	if lastErr == nil {
 		os.Remove(pcs.AudioPath)
 	}
