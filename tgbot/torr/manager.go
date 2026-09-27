@@ -971,6 +971,24 @@ func IsImageExt(path string) bool {
 	return isImageExt(path)
 }
 
+// formatETA — оценка оставшегося времени; при скорости около нуля или
+// оценке больше суток она бессмысленна.
+func formatETA(remainingBytes, bytesPerSec float64) string {
+	if bytesPerSec < 1024 || remainingBytes < 0 {
+		return "Неизвестно"
+	}
+	secs := remainingBytes / bytesPerSec
+	switch {
+	case secs > 24*3600:
+		return "Неизвестно"
+	case secs < 60:
+		return "меньше минуты"
+	case secs < 3600:
+		return fmt.Sprintf("%d мин", int(secs/60+0.5))
+	}
+	return fmt.Sprintf("%d ч %02d мин", int(secs)/3600, int(secs)/60%60)
+}
+
 func isImageExt(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
@@ -1358,11 +1376,7 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 		return
 	}
 
-	if ti.DownloadSpeed == 0 {
-		ti.DownloadSpeed = 1.0
-	}
-
-	wait := time.Duration(float64(file.Loaded())/ti.DownloadSpeed) * time.Second
+	wait := formatETA(float64(file.Loaded()), ti.DownloadSpeed)
 	speed := humanize.Bytes(uint64(ti.DownloadSpeed)) + "/sec"
 	peers := fmt.Sprintf("%v (%v/%v)", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
 
@@ -1396,7 +1410,7 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
 		msg += fmt.Sprintf("Данные: %s / %s\n", downloadedStr, totalStr)
 		msg += fmt.Sprintf("Скорость: %s | Пиры: %s\n", speed, peers)
-		msg += fmt.Sprintf("Осталось: %s\n\n", wait.String())
+		msg += fmt.Sprintf("Осталось: %s\n\n", wait)
 	} else {
 		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
 		msg += "⏳ <i>Финализация файла...</i>\n\n"
