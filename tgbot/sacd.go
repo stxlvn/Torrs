@@ -112,7 +112,8 @@ func linkImages(fromDir, toDir string) {
 }
 
 func extractSACD(c tele.Context, fc cueFileCtx) error {
-	UpdateAudioProgress(fc.RootTmp, fmt.Sprintf("💿 <b>%s</b>\nИзвлечение треков из SACD…", html.EscapeString(filepath.Base(fc.AudioPath))))
+	UpdateAudioProgress(fc.RootTmp, fmt.Sprintf("💿 Извлечение треков из SACD: %s…", html.EscapeString(filepath.Base(fc.AudioPath))))
+	defer UpdateAudioProgress(fc.RootTmp, "")
 	outDir := filepath.Join(fc.dir(), ".sacd_"+fc.fileHash())
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		completeAudioTask(fc.RootTmp)

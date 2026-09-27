@@ -975,7 +975,7 @@ func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []
 
 	var lastErr error
 	for i, cut := range pcs.Cuts {
-		UpdateAudioProgress(pcs.RootTmp, fmt.Sprintf("🎼 <b>%s</b>\nНарезка по cue: трек %d из %d", html.EscapeString(filepath.Base(pcs.AudioPath)), i+1, len(pcs.Cuts)))
+		UpdateAudioProgress(pcs.RootTmp, fmt.Sprintf("🎼 Нарезка по cue: %s — трек %d из %d", html.EscapeString(filepath.Base(pcs.AudioPath)), i+1, len(pcs.Cuts)))
 
 		end := cut.End
 		stop := end
@@ -1035,6 +1035,7 @@ func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []
 	if lastErr == nil {
 		os.Remove(pcs.AudioPath)
 	}
+	UpdateAudioProgress(pcs.RootTmp, "")
 	return lastErr
 }
 

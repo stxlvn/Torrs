@@ -119,6 +119,18 @@ type Worker struct {
 	// троттлинг статус-сообщения был бы гонкой данных.
 	statusMu         sync.Mutex
 	lastStatusUpdate time.Time
+
+	// audioStage — текущий этап асинхронной аудио-обработки (нарезка по
+	// cue, извлечение SACD), показывается отдельным блоком статуса.
+	audioStage atomic.Value
+}
+
+func (wrk *Worker) audioStageBlock() string {
+	stage, _ := wrk.audioStage.Load().(string)
+	if stage == "" {
+		return ""
+	}
+	return "🎛 <b>Обработка аудио:</b>\n" + stage + "\n\n"
 }
 
 // throttleStatusUpdate возвращает true не чаще, чем раз в minInterval —
@@ -496,10 +508,13 @@ func loading(wrk *Worker) {
 		userOnDone()
 		finishOnce.Do(func() { close(finished) })
 	}
-	progress := onProgress
 	onProgress = func(text string) {
 		touch()
-		progress(text)
+		wrk.audioStage.Store(text)
+		if pipelineFailed.Load() || wrk.isCancelled.Load() {
+			return
+		}
+		wrk.reportUploadProgress(totalFiles, int(wrk.completedFiles.Load()))
 	}
 
 	onBytes := func(n int64) {
@@ -859,6 +874,7 @@ func (wrk *Worker) reportUploadProgress(totalFiles, completedFiles int) {
 	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
 	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(percent), percent)
 	msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(uploaded)), humanize.Bytes(uint64(totalBytes)))
+	msg += wrk.audioStageBlock()
 	msg += "⚙️ <code>" + wrk.torrentHash + "</code>"
 
 	torrKbd := &tele.ReplyMarkup{}
@@ -1323,6 +1339,7 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 		msg += "⏳ <i>Ожидание скачивания файлов...</i>\n\n"
 	}
 
+	msg += wrk.audioStageBlock()
 	msg += "⚙️ <code>" + file.hash + "</code>"
 
 	torrKbd := &tele.ReplyMarkup{}
