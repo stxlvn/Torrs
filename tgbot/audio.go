@@ -326,51 +326,15 @@ func completeAudioTask(rootTmp string) {
 // одиночной отправки, и нужно откатиться на fallback (7z-архивация через
 // LargeFileProcessor). Когда oversized=false, fallback всегда nil.
 func ProcessAudioFile(c tele.Context, filePath string, hash string, rootTmp string, fileID int, oversized bool, fallback func() error) error {
-	ext := strings.ToLower(filepath.Ext(filePath))
-	if ext != ".mp3" && ext != ".flac" && ext != ".m4a" && ext != ".ogg" {
-		// Задача была зарегистрирована manager'ом до вызова — закрываем,
-		// иначе счётчик никогда не дойдёт до нуля.
+	fc := cueFileCtx{AudioPath: filePath, Hash: hash, RootTmp: rootTmp, FileID: fileID, Oversized: oversized, Fallback: fallback}
+	if torr.IsSACDImage(filePath) {
+		return processSACD(c, fc)
+	}
+	if !torr.IsAudioExt(filePath) {
 		completeAudioTask(rootTmp)
 		return nil
 	}
-
-	// Cue-sheet проверяем ДО конвертации в M4A: если пользователь подтвердит
-	// нарезку, резать (и заодно перекодировать под Bot API) нужно из
-	// исходного FLAC по кускам, а не из уже сконвертированного целиком
-	// файла. Сопроводительные .cue на диск кладёт prefetchCueSheets в
-	// tgbot/torr/cue.go — до вызова ProcessAudioFile. В папке может быть
-	// несколько .cue (или один общий на несколько файлов, см.
-	// CueFileSection) — перебираем все, пока какой-то не подойдёт именно
-	// этому файлу.
-	var cueMeta *CueTrackMeta
-	if ext == ".flac" {
-		for _, cuePath := range findSiblingCueFiles(filePath) {
-			handled, meta, err := offerCueSplit(c, filePath, cuePath, hash, rootTmp, fileID, oversized, fallback)
-			if handled {
-				return err
-			}
-			if meta != nil {
-				cueMeta = meta
-			}
-			// этот .cue не описывает данный файл/не разобрался — пробуем
-			// следующий, а если это был последний — обычный путь ниже.
-		}
-	}
-
-	if oversized {
-		// Не оказался настоящим cue-кандидатом, но превышает лимит
-		// одиночной отправки — уходим в 7z-архивацию тем же путём, что и
-		// раньше (до того как manager.go пропустил файл сюда в обход
-		// порога). Порядок важен: сначала fallback (файл на диске ещё
-		// должен существовать), потом completeAudioTask — иначе счётчик
-		// может дойти до нуля и папка удалится до того, как архиватор
-		// прочитает файл.
-		err := fallback()
-		completeAudioTask(rootTmp)
-		return err
-	}
-
-	return processAudioFileNormally(c, filePath, hash, rootTmp, fileID, cueMeta)
+	return processWithCue(c, cueFileCtx{AudioPath: filePath, Hash: hash, RootTmp: rootTmp, FileID: fileID, Oversized: oversized, Fallback: fallback}, false)
 }
 
 // audioCacheKey — ключ кэша Telegram file_id (db.SaveTGFileID/GetTGFileID)
@@ -390,7 +354,10 @@ func audioCacheKey(hash string, fileID int) string {
 // отказался от нарезки (там cueMeta всегда nil — секция с >=2 треками не
 // сводится к одному названию).
 func processAudioFileNormally(c tele.Context, filePath string, hash string, rootTmp string, fileID int, cueMeta *CueTrackMeta) error {
-	cacheKey := audioCacheKey(hash, fileID)
+	return processAudioFileWithKey(c, filePath, hash, rootTmp, audioCacheKey(hash, fileID), cueMeta)
+}
+
+func processAudioFileWithKey(c tele.Context, filePath string, hash string, rootTmp string, cacheKey string, cueMeta *CueTrackMeta) error {
 
 	// Проверяем вшитую обложку в ИСХОДНОМ файле — до конвертации, потому
 	// что convertToM4A (-vn) выбрасывает встроенную картинку. Сама
@@ -515,6 +482,10 @@ func finishAudioProcessing(c tele.Context, pc *PendingCover, track queuedTrack, 
 // из-за чего пользователь для FLAC вообще не видел меню.
 func deliverTrack(c tele.Context, pc *PendingCover, track queuedTrack, coverPath string) error {
 	ext := strings.ToLower(filepath.Ext(track.Path))
+	if converted, ok := convertForTelegram(track.Path); ok {
+		track.Path = converted
+		ext = strings.ToLower(filepath.Ext(converted))
+	}
 
 	if ext == ".flac" && userbot.Ready() {
 		var coverBytes []byte
@@ -582,6 +553,33 @@ func saveEmbeddedCoverOption(audioDir string, coverData []byte) (string, error) 
 	return path, nil
 }
 
+// convertForTelegram приводит форматы, которые Telegram не проигрывает как
+// музыку (APE, WavPack, WAV, TTA, TAK, AIFF, DSD, Opus, WMA...), к FLAC
+// (lossless, если есть юзербот) / ALAC или AAC.
+func convertForTelegram(src string) (string, bool) {
+	switch strings.ToLower(filepath.Ext(src)) {
+	case ".flac", ".mp3", ".m4a", ".ogg":
+		return "", false
+	}
+	p, err := probeAudio(src)
+	if err != nil {
+		log.Printf("[audio] %s: ffprobe не удался, отправляю как есть: %v", src, err)
+		return "", false
+	}
+	mode := lossyMode(p)
+	if p.Lossless() {
+		mode = outALAC
+		if userbot.Ready() {
+			mode = outFLAC
+		}
+	}
+	out := strings.TrimSuffix(src, filepath.Ext(src)) + mode.ext()
+	if err := transcodeAudio(src, out, 0, 0, p, mode, nil); err != nil {
+		return "", false
+	}
+	return out, true
+}
+
 func convertToM4A(flacPath string) (string, error) {
 	// Заменяем расширение .flac на .m4a, а не добавляем ".m4a" поверх —
 	// иначе получается двойное расширение "Track.flac.m4a", из-за которого
@@ -618,27 +616,32 @@ func readAudioInfo(filePath string) (artist, title string, duration int, hasCove
 	defer f.Close()
 
 	m, err := tag.ReadFrom(f)
-	if err != nil {
-		artist, title = parseFileName(filePath)
-	} else {
+	if err == nil {
 		artist = m.Artist()
 		title = m.Title()
-		if artist == "" || title == "" {
-			a, t := parseFileName(filePath)
-			if artist == "" {
-				artist = a
-			}
-			if title == "" {
-				title = t
-			}
-		}
 		if pic := m.Picture(); pic != nil {
 			hasCover = true
 			coverData = pic.Data
 		}
 	}
-
-	duration = getDurationFFprobe(filePath)
+	if p, perr := probeAudio(filePath); perr == nil {
+		artist = firstNonEmpty(artist, p.Tags["artist"], p.Tags["album_artist"])
+		title = firstNonEmpty(title, p.Tags["title"])
+		duration = int(p.Duration.Seconds())
+	}
+	if !hasCover && err != nil {
+		if data := extractEmbeddedCover(filePath); data != nil {
+			hasCover, coverData = true, data
+		}
+	}
+	if artist == "" || title == "" {
+		a, t := parseFileName(filePath)
+		artist = firstNonEmpty(artist, a)
+		title = firstNonEmpty(title, t)
+	}
+	if duration == 0 {
+		duration = getDurationFFprobe(filePath)
+	}
 	return
 }
 

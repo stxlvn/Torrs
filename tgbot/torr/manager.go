@@ -679,7 +679,7 @@ func runPipeline(wrk *Worker, totalFiles int, fileIndices []int, downloaded, com
 				// ownedByAudioProcessor — только БЕЗ картинок: их обработка
 				// (в т.ч. решение пропустить отправку) уже полностью
 				// завершена к этому моменту, откладывать нечего.
-				if !(isAudioExt(file.Path) && ownedByAudioProcessor(file, df.tmpPath)) {
+				if !((isAudioExt(file.Path) || isSACDFile(df.tmpPath)) && ownedByAudioProcessor(file, df.tmpPath)) {
 					wrk.uploadedBytes.Add(file.Length)
 				}
 				done := completed.Add(1)
@@ -745,11 +745,11 @@ func ownedByAudioProcessor(file *state.TorrentFileStat, diskPath string) bool {
 		// нарезать не показывалось вовсе, хотя cue был валиден.
 		return AudioProcessor != nil
 	}
+	if AudioProcessor != nil && isSACDFile(diskPath) {
+		return true
+	}
 	if !isAudioExt(file.Path) || AudioProcessor == nil || !isProcessableAudio(file.Path) {
 		return false
-	}
-	if file.Length >= safePartSize {
-		return isCueSplitCandidate(file.Path) && hasSiblingCueFile(diskPath)
 	}
 	return true
 }
@@ -961,19 +961,20 @@ func downloadFileToDiskOnce(wrk *Worker, file *state.TorrentFileStat, fi, fc int
 	return fullPath, nil
 }
 
-// isProcessableAudio — форматы, которые обрабатывает интерактивный
-// AudioProcessor (теги + обложки). ВАЖНО: список должен совпадать с
-// проверкой расширений в tgbot/audio.go ProcessAudioFile. Форматы вроде
-// .wav/.aac считаются аудио (isAudioExt), но идут обычным путём отправки —
-// раньше они попадали в AudioProcessor, который их молча игнорировал,
-// и такие файлы вообще не отправлялись пользователю.
+var audioExts = map[string]bool{
+	".mp3": true, ".flac": true, ".m4a": true, ".ogg": true, ".oga": true, ".opus": true,
+	".wav": true, ".aac": true, ".ape": true, ".wv": true, ".tta": true, ".tak": true,
+	".aiff": true, ".aif": true, ".aifc": true, ".dsf": true, ".dff": true, ".wma": true,
+}
+
+// isProcessableAudio — всё, что декодирует ffmpeg: нарезка по cue, теги,
+// обложки и перекодирование под Telegram делаются для любого из форматов.
 func isProcessableAudio(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".mp3", ".flac", ".m4a", ".ogg":
-		return true
-	}
-	return false
+	return isAudioExt(path)
+}
+
+func IsAudioExt(path string) bool {
+	return isAudioExt(path)
 }
 
 func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath string) error {
@@ -1004,8 +1005,8 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 	// хайрез-альбомы (24/192 и т.п., которые запросто превышают 1.9 ГБ
 	// одним файлом) всегда уходили в архив, даже не долетев до
 	// AudioProcessor — пользователь вообще не видел предложения нарезать.
-	isCueCandidate := isAudio && AudioProcessor != nil && isProcessableAudio(file.Path) &&
-		isCueSplitCandidate(file.Path) && hasSiblingCueFile(diskPath)
+	isSACD := AudioProcessor != nil && isSACDFile(diskPath)
+	isCueCandidate := isSACD || (isAudio && AudioProcessor != nil && isProcessableAudio(file.Path))
 
 	buildLargeFileFallback := func() func() error {
 		if LargeFileProcessor == nil {
@@ -1037,7 +1038,7 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 		return errors.New("файл превышает 1.9 ГБ, разбиение не настроено")
 	}
 
-	if isAudio && AudioProcessor != nil && isProcessableAudio(file.Path) {
+	if isSACD || (isAudio && AudioProcessor != nil && isProcessableAudio(file.Path)) {
 		// Регистрируем интерактивную аудиозадачу ДО вызова обработчика:
 		// её закроет tgbot/audio.go, когда трек будет реально отправлен
 		// (в т.ч. после того как пользователь выберет обложку, подтвердит
@@ -1188,12 +1189,7 @@ func sendCachedFile(wrk *Worker, file *state.TorrentFileStat, tgfid string) erro
 }
 
 func isAudioExt(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac":
-		return true
-	}
-	return false
+	return audioExts[strings.ToLower(filepath.Ext(path))]
 }
 
 func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {

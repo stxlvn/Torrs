@@ -7,6 +7,7 @@ require (
 	github.com/anacrolix/torrent v1.61.0
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/dustin/go-humanize v1.1.0
+	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f
 	github.com/gotd/td v0.162.0
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/oauth2 v0.37.0

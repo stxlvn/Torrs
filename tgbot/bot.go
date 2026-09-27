@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -90,6 +92,10 @@ func Start(token, host string) error {
 
 	b.Handle(tele.OnText, func(c tele.Context) error {
 		txt := c.Text()
+		if v, ok := cueExpect.Load(c.Sender().ID); ok && looksLikeCueText(txt) {
+			cueExpect.Delete(c.Sender().ID)
+			return handleCueUpload(c, v.(cueUploadTarget), []byte(txt))
+		}
 		if strings.HasPrefix(strings.ToLower(txt), "magnet:") || isHash(txt) {
 			return infoTorrent(c, c.Text())
 		} else if c.Message().ReplyTo != nil && c.Message().ReplyTo.ReplyMarkup != nil && len(c.Message().ReplyTo.ReplyMarkup.InlineKeyboard) > 0 {
@@ -140,10 +146,35 @@ func Start(token, host string) error {
 			return infoTorrent(c, hash)
 		}
 
+		ext := strings.ToLower(filepath.Ext(doc.FileName))
+		if v, ok := cueExpect.Load(c.Sender().ID); ok && (ext == ".cue" || ext == ".txt" || ext == "" || strings.HasPrefix(doc.MIME, "text/")) {
+			cueExpect.Delete(c.Sender().ID)
+			if doc.FileSize > maxCueSize {
+				cueExpect.Store(c.Sender().ID, v)
+				return c.Send("❌ Слишком большой файл для cue-sheet.")
+			}
+			rc, err := downloadTelegramFile(b, &doc.File)
+			if err != nil {
+				cueExpect.Store(c.Sender().ID, v)
+				log.Printf("[bot] cue %s: скачивание файла FAILED: %v", doc.FileName, err)
+				return c.Send("❌ Не удалось получить файл, пришлите ещё раз.")
+			}
+			data, err := io.ReadAll(io.LimitReader(rc, maxCueSize))
+			rc.Close()
+			if err != nil {
+				cueExpect.Store(c.Sender().ID, v)
+				return c.Send("❌ Не удалось прочитать файл, пришлите ещё раз.")
+			}
+			return handleCueUpload(c, v.(cueUploadTarget), data)
+		}
+
 		if info, ok := uploadExpect.Load(c.Sender().ID); ok {
 			inf := info.(uploadInfo)
 			uploadExpect.Delete(c.Sender().ID)
 			return handleCustomCoverUpload(c, inf.Hash, inf.DirHash, c.Message())
+		}
+		if ext == ".cue" {
+			return c.Send("Чтобы применить свой cue, нажмите «📄 Загрузить свой CUE» под нужным альбомом, затем пришлите файл.")
 		}
 		return nil
 	})

@@ -10,38 +10,6 @@ import (
 	"torrsru/tgbot/torr/state"
 )
 
-// isCueSplitCandidate — форматы, для которых имеет смысл искать
-// сопроводительный cue-sheet. Ограничено FLAC: это единственный формат из
-// обрабатываемых AudioProcessor'ом (см. isProcessableAudio), для которого
-// на практике встречается сценарий "альбом одним файлом + .cue". WAV/APE в
-// текущем пайплайне вообще не проходят через AudioProcessor.
-func isCueSplitCandidate(path string) bool {
-	return strings.EqualFold(filepath.Ext(path), ".flac")
-}
-
-// hasSiblingCueFile — быстрая проверка на диске (без скачивания и разбора)
-// наличия .cue файла в той же папке, что и diskPath. Используется
-// uploadFileFromDisk, чтобы решить, пропускать ли порог safePartSize для
-// файла — сам разбор cue и диалог с пользователем остаются на стороне
-// AudioProcessor (tgbot.ProcessAudioFile), который может обнаружить, что
-// cue на самом деле нет/не разбирается, и запросить откат на 7z.
-func hasSiblingCueFile(diskPath string) bool {
-	dir := filepath.Dir(diskPath)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if strings.EqualFold(filepath.Ext(e.Name()), ".cue") {
-			return true
-		}
-	}
-	return false
-}
-
 // prefetchCueSheets ищет для каждой выбранной "цельноальбомной" FLAC-дорожки
 // сопроводительные .cue в той же папке торрента — даже если пользователь их
 // не выбирал руками в файловом меню — и докачивает их рядом на диск, ДО
@@ -62,7 +30,7 @@ func prefetchCueSheets(wrk *Worker) {
 	dirsWithCandidate := make(map[string]bool)
 	for _, fi := range wrk.fileIndices {
 		f := wrk.ti.FileStats[fi]
-		if !isCueSplitCandidate(f.Path) {
+		if !isProcessableAudio(f.Path) {
 			continue
 		}
 		dir := filepath.Dir(strings.TrimPrefix(f.Path, "/"))
@@ -77,9 +45,12 @@ func prefetchCueSheets(wrk *Worker) {
 		if !strings.EqualFold(filepath.Ext(f.Path), ".cue") {
 			continue
 		}
-		dir := filepath.Dir(strings.TrimPrefix(f.Path, "/"))
-		if dirsWithCandidate[dir] {
-			cueFiles = append(cueFiles, f)
+		cueDir := filepath.Dir(strings.TrimPrefix(f.Path, "/"))
+		for dir := range dirsWithCandidate {
+			if dir == cueDir || cueDir == "." || strings.HasPrefix(dir, cueDir+"/") {
+				cueFiles = append(cueFiles, f)
+				break
+			}
 		}
 	}
 

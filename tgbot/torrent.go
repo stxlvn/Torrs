@@ -647,6 +647,27 @@ func getTorrent(c tele.Context) error {
 		return handleCueSplitConfirm(c, args[1], args[2])
 	}
 
+	if cmd == "\fsacdx" || cmd == "\fsacdarc" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleSACDChoice(c, args[1], args[2], cmd == "\fsacdx")
+	}
+
+	if cmd == "\fcueup" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleCueUploadRequest(c, args[1], args[2])
+	}
+
+	if cmd == "\fcuenone" {
+		if len(args) != 3 {
+			return errors.New("Ошибка данных")
+		}
+		return handleCuelessSkip(c, args[1], args[2])
+	}
+
 	if cmd == "\fcueskip" {
 		if len(args) != 3 {
 			return errors.New("Ошибка данных")
