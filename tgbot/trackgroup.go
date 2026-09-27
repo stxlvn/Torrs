@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -169,11 +170,12 @@ func sendViaRelay(c tele.Context, items []readyTrack) error {
 	if err != nil {
 		return err
 	}
-	var msgs []tele.Editable
-	for _, id := range ids {
-		msgs = append(msgs, tele.StoredMessage{MessageID: strconv.Itoa(id), ChatID: chatID})
-	}
-	if _, err := c.Bot().CopyMany(c.Recipient(), msgs); err != nil {
+	idsJSON, _ := json.Marshal(ids)
+	if _, err := c.Bot().Raw("copyMessages", map[string]string{
+		"chat_id":      c.Recipient().Recipient(),
+		"from_chat_id": strconv.FormatInt(chatID, 10),
+		"message_ids":  string(idsJSON),
+	}); err != nil {
 		return err
 	}
 	log.Printf("[audio] группа из %d треков отправлена через userbot+релей за %v (%s … %s)", len(items), time.Since(t0), filepath.Base(items[0].Path), filepath.Base(items[len(items)-1].Path))
