@@ -149,11 +149,7 @@ func pcmFixArgs(p *audioProbe, m outMode) []string {
 	}
 	var args []string
 	if p.IsDSD() {
-		rate := "88200"
-		if p.SampleRate > 352800 {
-			rate = "176400"
-		}
-		args = append(args, "-ar", rate)
+		args = append(args, "-ar", "88200")
 	}
 	s32, s16 := "s32", "s16"
 	if m == outALAC {

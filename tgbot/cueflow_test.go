@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -80,5 +81,53 @@ func TestFindCueForFile(t *testing.T) {
 	writeFile(t, bare, audio)
 	if m, meta := findCueForFile(fc(bare)); m != nil || meta != nil {
 		t.Fatalf("файл без cue: %+v %+v", m, meta)
+	}
+}
+
+func TestFindImagesInDir(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"Scans/Back.jpg", "Scans/Front.jpg", "Scans/Side 1.jpg", "booklet.png", ".cue_1234/x.jpg", "Scans/Deep/y.jpg"} {
+		writeFile(t, filepath.Join(dir, n), []byte("img"))
+	}
+	got := findImagesInDir(dir)
+	var rels []string
+	for _, p := range got {
+		r, _ := filepath.Rel(dir, p)
+		rels = append(rels, filepath.ToSlash(r))
+	}
+	want := []string{"Scans/Front.jpg", "booklet.png", "Scans/Back.jpg", "Scans/Side 1.jpg"}
+	if len(rels) != len(want) {
+		t.Fatalf("обложки: %v", rels)
+	}
+	for i := range want {
+		if rels[i] != want[i] {
+			t.Fatalf("порядок обложек: %v, ожидалось %v", rels, want)
+		}
+	}
+}
+
+func TestCoverPreviewOfHugeScan(t *testing.T) {
+	needFFmpeg(t)
+	dir := t.TempDir()
+	huge := filepath.Join(dir, "Inside 1.png")
+	out, err := exec.Command("ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+		"-i", "mandelbrot=size=6000x4000", "-frames:v", "1", huge).CombinedOutput()
+	if err != nil {
+		t.Skipf("ffmpeg: %v %s", err, out)
+	}
+	tif := filepath.Join(dir, "Back.tif")
+	exec.Command("ffmpeg", "-v", "error", "-y", "-i", huge, "-frames:v", "1", tif).Run()
+	for _, src := range []string{huge, tif} {
+		st, _ := os.Stat(src)
+		p, temp := coverPreviewFile(src)
+		if !temp {
+			t.Fatalf("%s (%d байт) не пережат", src, st.Size())
+		}
+		ps, _ := os.Stat(p)
+		if ps.Size() > maxPreviewFileSize {
+			t.Errorf("%s: превью %d байт", src, ps.Size())
+		}
+		t.Logf("%s: %d -> %d байт", filepath.Base(src), st.Size(), ps.Size())
+		os.Remove(p)
 	}
 }

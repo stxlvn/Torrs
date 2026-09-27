@@ -52,7 +52,7 @@ func prefetchFolderImages(wrk *Worker) {
 			continue
 		}
 		dir := filepath.Dir(strings.TrimPrefix(f.Path, "/"))
-		if dirsWithAudio[dir] {
+		if dirsWithAudio[dir] || dirsWithAudio[filepath.Dir(dir)] {
 			imageFiles = append(imageFiles, f)
 		}
 	}

@@ -866,6 +866,10 @@ func (wrk *Worker) reportUploadProgress(totalFiles, completedFiles int) {
 	wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
 }
 
+func IsImageExt(path string) bool {
+	return isImageExt(path)
+}
+
 func isImageExt(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {

@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -943,29 +945,75 @@ func sendAudio(c tele.Context, filePath, artist, title string, duration int, cov
 // findImagesInDir ищет в папке файлы-обложки. Поиск регистронезависимый
 // (Cover.JPG, COVER.jpg и т.п.) и охватывает расширенный список форматов;
 // ffmpeg умеет декодировать любой из них при сжатии/вшивании.
-func findImagesInDir(dir string) []string {
-	exts := []string{
-		".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif",
-		".tif", ".tiff", ".jfif", ".heic", ".heif", ".avif",
-	}
+var coverNameRe = regexp.MustCompile(`(?i)(cover|front|folder|jacket|обложк)`)
 
-	entries, err := os.ReadDir(dir)
+const (
+	maxCoverOptions    = 10
+	maxPreviewFileSize = 5 << 20
+)
+
+// coverPreviewFile — картинка для показа в меню выбора обложки: большие
+// сканы и форматы, которые Telegram не показывает (TIFF, BMP, HEIC...),
+// пережимаются в JPEG до 2560 px по большей стороне.
+func coverPreviewFile(img string) (string, bool) {
+	ext := strings.ToLower(filepath.Ext(img))
+	if st, err := os.Stat(img); err == nil && st.Size() <= maxPreviewFileSize && (ext == ".jpg" || ext == ".jpeg" || ext == ".png") {
+		return img, false
+	}
+	out := filepath.Join(os.TempDir(), "cover_preview_"+crcHex(img)+".jpg")
+	t0 := time.Now()
+	res, err := exec.Command("ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", img, "-frames:v", "1",
+		"-vf", "scale='min(2560,iw)':'min(2560,ih)':force_original_aspect_ratio=decrease", "-q:v", "3", out).CombinedOutput()
 	if err != nil {
-		return nil
+		os.Remove(out)
+		log.Printf("[audio] превью обложки %s: ffmpeg: %v: %s", img, err, res)
+		return img, false
 	}
+	log.Printf("[audio] превью обложки %s сжато за %v", filepath.Base(img), time.Since(t0))
+	return out, true
+}
 
-	var images []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+func findImagesInDir(dir string) []string {
+	type cand struct {
+		path  string
+		depth int
+		prio  bool
+	}
+	var cands []cand
+	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
 		}
-		ext := strings.ToLower(filepath.Ext(e.Name()))
-		for _, want := range exts {
-			if ext == want {
-				images = append(images, filepath.Join(dir, e.Name()))
-				break
+		rel, _ := filepath.Rel(dir, p)
+		depth := strings.Count(filepath.ToSlash(rel), "/")
+		if d.IsDir() {
+			if p != dir && (strings.HasPrefix(d.Name(), ".") || depth >= 1) {
+				return fs.SkipDir
 			}
+			return nil
 		}
+		if !torr.IsImageExt(p) {
+			return nil
+		}
+		cands = append(cands, cand{path: p, depth: depth, prio: coverNameRe.MatchString(d.Name())})
+		return nil
+	})
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.prio != b.prio {
+			return a.prio
+		}
+		if a.depth != b.depth {
+			return a.depth < b.depth
+		}
+		return naturalLess(a.path, b.path)
+	})
+	var images []string
+	for i, c := range cands {
+		if i == maxCoverOptions {
+			break
+		}
+		images = append(images, c.path)
 	}
 	return images
 }
@@ -1042,12 +1090,20 @@ func offerCoverSelection(c tele.Context, hash string, images []string, dirHash, 
 	folderName := filepath.Base(audioDir)
 
 	for i, img := range images {
+		preview, temp := coverPreviewFile(img)
+		name := filepath.Base(img)
+		if temp {
+			name = strings.TrimSuffix(name, filepath.Ext(name)) + ".jpg"
+		}
 		doc := &tele.Document{
-			FileName: filepath.Base(img),
+			FileName: name,
 			Caption:  fmt.Sprintf("Вариант %d: %s", i+1, filepath.Base(img)),
-			File:     tele.FromDisk(img),
+			File:     tele.FromDisk(preview),
 		}
 		sentMsg, err := c.Bot().Send(c.Recipient(), doc)
+		if temp {
+			os.Remove(preview)
+		}
 		if err != nil {
 			log.Printf("[audio] не удалось показать превью обложки %q: %v", img, err)
 			continue
