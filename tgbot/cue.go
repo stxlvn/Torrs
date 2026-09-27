@@ -29,6 +29,7 @@ const (
 	cuelessMinDuration    = 10 * time.Minute
 	cuelessMaxFolderAudio = 4
 	cuePreviewLines       = 12
+	oversizedLimit        = 1_900_000_000
 )
 
 // cueFileCtx — один аудиофайл задачи, ожидающий решения по cue.
@@ -343,6 +344,10 @@ func processWithCue(c tele.Context, fc cueFileCtx, auto bool) error {
 
 func proceedAsIs(c tele.Context, fc cueFileCtx, meta *CueTrackMeta) error {
 	if fc.Oversized {
+		if small, ok := shrinkOversized(fc.AudioPath); ok {
+			os.Remove(fc.AudioPath)
+			return processAudioFileWithKey(c, small, fc.Hash, fc.RootTmp, audioCacheKey(fc.Hash, fc.FileID), meta)
+		}
 		if fc.Fallback == nil {
 			completeAudioTask(fc.RootTmp)
 			return errors.New("файл превышает 1.9 ГБ, разбиение не настроено")
@@ -352,6 +357,27 @@ func proceedAsIs(c tele.Context, fc cueFileCtx, meta *CueTrackMeta) error {
 		return err
 	}
 	return processAudioFileNormally(c, fc.AudioPath, fc.Hash, fc.RootTmp, fc.FileID, meta)
+}
+
+// shrinkOversized пробует уложить файл больше лимита в обычную отправку,
+// сжав его без потерь (DSD/WAV/AIFF и т.п. -> FLAC или ALAC).
+func shrinkOversized(src string) (string, bool) {
+	ext := strings.ToLower(filepath.Ext(src))
+	if ext == ".flac" || ext == ".mp3" || ext == ".m4a" || ext == ".ogg" {
+		return "", false
+	}
+	out, ok := convertForTelegram(src)
+	if !ok {
+		return "", false
+	}
+	st, err := os.Stat(out)
+	if err != nil || st.Size() >= oversizedLimit {
+		os.Remove(out)
+		log.Printf("[audio] %s: после сжатия всё ещё больше лимита, архивирую", src)
+		return "", false
+	}
+	log.Printf("[audio] %s: сжат до %d байт, отправляю как трек", src, st.Size())
+	return out, true
 }
 
 func skipLabel(oversized bool, all bool) string {
@@ -618,13 +644,11 @@ func offerCueless(c tele.Context, fc cueFileCtx) (bool, error) {
 	if p, err := probeAudio(fc.AudioPath); err == nil {
 		dur = p.Duration
 	}
-	if !fc.Oversized {
-		if dur < cuelessMinDuration {
-			return false, nil
-		}
-		if n := len(torrentAudioRels(fc.Hash, fc.RootTmp, fc.dir(), false)); n > cuelessMaxFolderAudio {
-			return false, nil
-		}
+	if !fc.Oversized && dur < cuelessMinDuration {
+		return false, nil
+	}
+	if n := len(torrentAudioRels(fc.Hash, fc.RootTmp, fc.dir(), false)); n > cuelessMaxFolderAudio {
+		return false, nil
 	}
 
 	key := userKey(c, fc.Hash, fc.fileHash())
@@ -961,6 +985,9 @@ func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []
 		os.Remove(outPath)
 	}
 	os.Remove(outDir)
+	if lastErr == nil {
+		os.Remove(pcs.AudioPath)
+	}
 	return lastErr
 }
 

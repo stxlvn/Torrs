@@ -481,9 +481,16 @@ func finishAudioProcessing(c tele.Context, pc *PendingCover, track queuedTrack, 
 // выбор раньше делался ДО выбора обложки (см. processAudioFileNormally),
 // из-за чего пользователь для FLAC вообще не видел меню.
 func deliverTrack(c tele.Context, pc *PendingCover, track queuedTrack, coverPath string) error {
+	cleanup := []string{track.Path}
+	defer func() {
+		for _, p := range cleanup {
+			os.Remove(p)
+		}
+	}()
 	ext := strings.ToLower(filepath.Ext(track.Path))
 	if converted, ok := convertForTelegram(track.Path); ok {
 		track.Path = converted
+		cleanup = append(cleanup, converted)
 		ext = strings.ToLower(filepath.Ext(converted))
 	}
 
@@ -510,6 +517,7 @@ func deliverTrack(c tele.Context, pc *PendingCover, track queuedTrack, coverPath
 		} else {
 			log.Printf("[audio] %s: конвертация FLAC -> M4A успешна -> %s", filePath, m4aPath)
 			filePath = m4aPath
+			cleanup = append(cleanup, m4aPath)
 		}
 	}
 
