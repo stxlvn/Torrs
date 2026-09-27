@@ -127,7 +127,7 @@ func Start(token, host string) error {
 			rc, err := downloadTelegramFile(b, &doc.File)
 			if err != nil {
 				log.Printf("[bot] .torrent %s: скачивание файла FAILED: %v", doc.FileName, err)
-				return nil
+				return c.Send("❌ Не удалось получить .torrent-файл, попробуйте ещё раз или пришлите magnet-ссылку.")
 			}
 			defer rc.Close()
 			meta, err := metainfo.Load(rc)
