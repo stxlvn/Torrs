@@ -971,8 +971,17 @@ func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []
 	}
 	log.Printf("[cue] %s: нарезка %d треков, кодек=%s (%s, %d бит, %d Гц) -> %s", pcs.AudioPath, len(pcs.Cuts), probe.Codec, probe.SampleFmt, probe.BitsRaw, probe.SampleRate, mode.ext())
 
+	group := filepath.Dir(pcs.AudioPath)
+	cutOrder := func(n int) string { return fmt.Sprintf("%s/%05d", group, n) }
+	var producer *trackProducer
+	if len(pcs.Cuts) > 0 {
+		producer = startTrackProducer(c, pcs.RootTmp, group, cutOrder(pcs.Cuts[0].Number))
+		defer producer.done()
+	}
+
 	var lastErr error
 	for i, cut := range pcs.Cuts {
+		producer.advance(cutOrder(cut.Number))
 		UpdateAudioProgress(pcs.RootTmp, fmt.Sprintf("🎼 Нарезка по cue: %s — трек %d из %d", html.EscapeString(filepath.Base(pcs.AudioPath)), i+1, len(pcs.Cuts)))
 
 		end := cut.End
@@ -987,8 +996,7 @@ func performCueSplitWithCover(c tele.Context, pcs *PendingCueSplit, coverData []
 		durSecs := int((stop - cut.Start).Seconds())
 
 		cacheKey := fmt.Sprintf("%s#%d", audioCacheKey(pcs.Hash, pcs.FileID), cut.Number)
-		order := fmt.Sprintf("%s/%05d", filepath.Dir(pcs.AudioPath), cut.Number)
-		group := filepath.Dir(pcs.AudioPath)
+		order := cutOrder(cut.Number)
 		if tgfid := db.GetTGFileID(cacheKey); tgfid != "" {
 			enqueueTrack(c, pcs.RootTmp, group, readyTrack{FileID: tgfid, Title: cut.Title, Performer: cut.Performer, Order: order})
 			continue

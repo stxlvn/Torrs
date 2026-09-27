@@ -3,6 +3,10 @@ package tgbot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"log"
 	"os"
 	"path/filepath"
@@ -40,6 +44,88 @@ type trackQueue struct {
 	sendMu sync.Mutex
 	c      tele.Context
 	items  []readyTrack
+	active map[int]string // незавершённые источники треков -> их минимальный Order
+	nextID int
+}
+
+func getTrackQueue(rootTmp, group string) *trackQueue {
+	v, _ := trackQueues.LoadOrStore(rootTmp+"\x00"+group, &trackQueue{active: map[int]string{}})
+	return v.(*trackQueue)
+}
+
+// takeReleasableLocked забирает из очереди первые 10 треков по порядку, если
+// ни один незавершённый источник (нарезка, конвертация) уже не может выдать
+// трек, стоящий раньше них.
+func (q *trackQueue) takeReleasableLocked() []readyTrack {
+	sendTrackGroupSort(q.items)
+	limit, hasLimit := "", false
+	for _, o := range q.active {
+		if !hasLimit || naturalLess(o, limit) {
+			limit, hasLimit = o, true
+		}
+	}
+	ready := len(q.items)
+	if hasLimit {
+		ready = 0
+		for ready < len(q.items) && naturalLess(q.items[ready].Order, limit) {
+			ready++
+		}
+	}
+	if ready < trackGroupSize {
+		return nil
+	}
+	batch := append([]readyTrack(nil), q.items[:trackGroupSize]...)
+	q.items = q.items[trackGroupSize:]
+	return batch
+}
+
+func (q *trackQueue) release() {
+	for {
+		q.mu.Lock()
+		batch, c := q.takeReleasableLocked(), q.c
+		q.mu.Unlock()
+		if batch == nil {
+			return
+		}
+		q.sendMu.Lock()
+		trackGroupSender(c, batch)
+		q.sendMu.Unlock()
+	}
+}
+
+// trackProducer — источник треков папки (нарезка по cue, конвертация
+// трека): пока он не завершён, треки с Order не меньше его текущего не
+// уходят, чтобы параллельная обработка не перемешала порядок в группах.
+type trackProducer struct {
+	q  *trackQueue
+	id int
+}
+
+func startTrackProducer(c tele.Context, rootTmp, group, minOrder string) *trackProducer {
+	q := getTrackQueue(rootTmp, group)
+	q.mu.Lock()
+	q.c = c
+	q.nextID++
+	id := q.nextID
+	q.active[id] = minOrder
+	q.mu.Unlock()
+	return &trackProducer{q: q, id: id}
+}
+
+func (p *trackProducer) advance(order string) {
+	p.q.mu.Lock()
+	if _, ok := p.q.active[p.id]; ok {
+		p.q.active[p.id] = order
+	}
+	p.q.mu.Unlock()
+	p.q.release()
+}
+
+func (p *trackProducer) done() {
+	p.q.mu.Lock()
+	delete(p.q.active, p.id)
+	p.q.mu.Unlock()
+	p.q.release()
 }
 
 var trackQueues sync.Map // rootTmp + "\x00" + папка -> *trackQueue
@@ -49,22 +135,12 @@ var trackGroupSender = sendTrackGroup
 // enqueueTrack копит треки папки и отправляет их альбомами по 10; остаток
 // уходит через FlushTracks, когда все треки задачи готовы.
 func enqueueTrack(c tele.Context, rootTmp, group string, t readyTrack) {
-	v, _ := trackQueues.LoadOrStore(rootTmp+"\x00"+group, &trackQueue{})
-	q := v.(*trackQueue)
+	q := getTrackQueue(rootTmp, group)
 	q.mu.Lock()
 	q.c = c
 	q.items = append(q.items, t)
-	var batch []readyTrack
-	if len(q.items) >= trackGroupSize {
-		batch = append([]readyTrack(nil), q.items[:trackGroupSize]...)
-		q.items = q.items[trackGroupSize:]
-	}
 	q.mu.Unlock()
-	if batch != nil {
-		q.sendMu.Lock()
-		trackGroupSender(c, batch)
-		q.sendMu.Unlock()
-	}
+	q.release()
 }
 
 func FlushTracks(rootTmp string) {
@@ -244,36 +320,11 @@ func sendViaBotAPI(c tele.Context, items []readyTrack) {
 
 	var sendErr error
 	for attempt := 1; attempt <= maxAudioSendRetries; attempt++ {
-		var album tele.Album
-		var files []*os.File
-		for _, it := range items {
-			a := &tele.Audio{Title: it.Title, Performer: it.Performer, Duration: it.Duration, MIME: audioMIME(it.Path)}
-			if it.FileID != "" {
-				a.File = tele.File{FileID: it.FileID}
-			} else {
-				f, err := os.Open(it.Path)
-				if err != nil {
-					sendErr = err
-					break
-				}
-				files = append(files, f)
-				a.File = tele.FromReader(f)
-				a.FileName = filepath.Base(it.Path)
-			}
-			album = append(album, a)
-		}
+		t0 := time.Now()
 		var msgs []tele.Message
-		if len(album) == len(items) {
-			t0 := time.Now()
-			msgs, sendErr = c.Bot().SendAlbum(c.Recipient(), album)
-			if sendErr == nil {
-				log.Printf("[audio] группа из %d треков отправлена через Bot API за %v", len(items), time.Since(t0))
-			}
-		}
-		for _, f := range files {
-			f.Close()
-		}
+		msgs, sendErr = sendAudioMediaGroup(c.Recipient().Recipient(), items)
 		if sendErr == nil {
+			log.Printf("[audio] группа из %d треков отправлена через Bot API за %v", len(items), time.Since(t0))
 			for i, m := range msgs {
 				if i < len(items) && items[i].CacheKey != "" && m.Audio != nil && m.Audio.FileID != "" {
 					db.SaveTGFileID(items[i].CacheKey, m.Audio.FileID)
@@ -291,4 +342,108 @@ func sendViaBotAPI(c tele.Context, items []readyTrack) {
 	for _, it := range items {
 		sendViaBotAPI(c, []readyTrack{it})
 	}
+}
+
+// sendAudioMediaGroup — sendMediaGroup с превью-обложкой у каждого трека
+// (telebot не передаёт thumbnail для аудио в альбоме). Файлы уходят
+// потоком multipart, без чтения в память.
+func sendAudioMediaGroup(chatID string, items []readyTrack) ([]tele.Message, error) {
+	type inputAudio struct {
+		Type      string `json:"type"`
+		Media     string `json:"media"`
+		Thumbnail string `json:"thumbnail,omitempty"`
+		Title     string `json:"title,omitempty"`
+		Performer string `json:"performer,omitempty"`
+		Duration  int    `json:"duration,omitempty"`
+	}
+	var media []inputAudio
+	for i, it := range items {
+		m := inputAudio{Type: "audio", Title: it.Title, Performer: it.Performer, Duration: it.Duration, Media: it.FileID}
+		if it.FileID == "" {
+			m.Media = fmt.Sprintf("attach://a%d", i)
+		}
+		if len(it.Cover) > 0 && it.FileID == "" {
+			m.Thumbnail = fmt.Sprintf("attach://t%d", i)
+		}
+		media = append(media, m)
+	}
+	mediaJSON, err := json.Marshal(media)
+	if err != nil {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		err := func() error {
+			if err := mw.WriteField("chat_id", chatID); err != nil {
+				return err
+			}
+			if err := mw.WriteField("media", string(mediaJSON)); err != nil {
+				return err
+			}
+			for i, it := range items {
+				if it.FileID != "" {
+					continue
+				}
+				f, err := os.Open(it.Path)
+				if err != nil {
+					return err
+				}
+				part, err := mw.CreateFormFile(fmt.Sprintf("a%d", i), filepath.Base(it.Path))
+				if err == nil {
+					_, err = io.Copy(part, f)
+				}
+				f.Close()
+				if err != nil {
+					return err
+				}
+				if len(it.Cover) > 0 {
+					part, err := mw.CreateFormFile(fmt.Sprintf("t%d", i), "cover.jpg")
+					if err != nil {
+						return err
+					}
+					if _, err := part.Write(it.Cover); err != nil {
+						return err
+					}
+				}
+			}
+			return mw.Close()
+		}()
+		pw.CloseWithError(err)
+	}()
+
+	req, err := http.NewRequest(http.MethodPost, botAPIHost+"/bot"+botToken+"/sendMediaGroup", pr)
+	if err != nil {
+		pr.Close()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := (&http.Client{Timeout: 35 * time.Minute}).Do(req)
+	if err != nil {
+		pr.Close()
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Ok          bool           `json:"ok"`
+		Description string         `json:"description"`
+		ErrorCode   int            `json:"error_code"`
+		Parameters  map[string]any `json:"parameters"`
+		Result      []tele.Message `json:"result"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("sendMediaGroup: %v: %s", err, body)
+	}
+	if !out.Ok {
+		if ra, ok := out.Parameters["retry_after"].(float64); ok {
+			return nil, tele.FloodError{RetryAfter: int(ra)}
+		}
+		return nil, fmt.Errorf("sendMediaGroup: %d %s", out.ErrorCode, out.Description)
+	}
+	return out.Result, nil
 }

@@ -58,3 +58,47 @@ func TestTrackGrouping(t *testing.T) {
 		t.Fatal("повторная досылка отправила лишнее")
 	}
 }
+
+func TestTrackGroupingWaitsForEarlierProducer(t *testing.T) {
+	var sent [][]string
+	orig := trackGroupSender
+	trackGroupSender = func(_ tele.Context, items []readyTrack) {
+		var names []string
+		for _, it := range items {
+			names = append(names, it.Title)
+		}
+		sent = append(sent, names)
+	}
+	defer func() { trackGroupSender = orig }()
+
+	root, group := "/tmp/torrdl_order", "LP"
+	order := func(n int) string { return fmt.Sprintf("LP/%05d", n) }
+	add := func(n int) {
+		enqueueTrack(nil, root, group, readyTrack{Title: fmt.Sprintf("%02d", n), Order: order(n)})
+	}
+	for n := 1; n <= 5; n++ {
+		add(n)
+	}
+	side2 := startTrackProducer(nil, root, group, order(6))
+	side3 := startTrackProducer(nil, root, group, order(11))
+	for n := 11; n <= 14; n++ {
+		side3.advance(order(n))
+		add(n)
+	}
+	side3.done()
+	if len(sent) != 0 {
+		t.Fatalf("треки 11+ ушли раньше 6–10: %v", sent)
+	}
+	for n := 6; n <= 10; n++ {
+		side2.advance(order(n))
+		add(n)
+	}
+	side2.done()
+	if len(sent) != 1 || strings.Join(sent[0], ",") != "01,02,03,04,05,06,07,08,09,10" {
+		t.Fatalf("первая группа: %v", sent)
+	}
+	FlushTracks(root)
+	if len(sent) != 2 || strings.Join(sent[1], ",") != "11,12,13,14" {
+		t.Fatalf("остаток: %v", sent)
+	}
+}

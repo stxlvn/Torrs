@@ -524,6 +524,10 @@ func finishAudioProcessing(c tele.Context, pc *PendingCover, track queuedTrack, 
 func deliverTrack(c tele.Context, pc *PendingCover, track queuedTrack, coverPath string) error {
 	cleanup := []string{track.Path}
 	order := track.Path
+	if pc != nil {
+		producer := startTrackProducer(c, pc.RootTmp, pc.AudioDir, order)
+		defer producer.done()
+	}
 	if converted, ok := convertForTelegram(track.Path); ok {
 		track.Path = converted
 		cleanup = append(cleanup, converted)
