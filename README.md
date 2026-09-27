@@ -53,15 +53,15 @@ sudo apt install -y git curl ffmpeg p7zip-full
   длительности треков. Обязателен.
 - **p7zip-full** (даёт бинарник `7z`) — архивация файлов > 1.9 ГБ на тома.
   Обязателен.
-- **Go 1.25+** — компилятор. Если `go version` показывает более старую
+- **Go 1.26+** — компилятор. Если `go version` показывает более старую
   версию или Go не установлен:
   ```bash
-  curl -fsSL -o go.tar.gz https://go.dev/dl/go1.25.0.linux-amd64.tar.gz
+  curl -fsSL -o go.tar.gz https://go.dev/dl/go1.26.8.linux-amd64.tar.gz
   sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go.tar.gz
   echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
   go version
   ```
-  (модуль проекта указывает `go 1.25.0` — при наличии более новой версии
+  (модуль проекта указывает `go 1.26.0` — при наличии более новой версии
   `GOTOOLCHAIN=auto` сам подтянет нужную при первой сборке).
 - **Docker** — для локального Bot API сервера (см. ниже). Можно обойтись
   без него, собрав `telegram-bot-api` из исходников самостоятельно, но
