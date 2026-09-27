@@ -263,6 +263,45 @@ func AddAudioTask(rootTmp string, bytes int64) {
 
 // CompleteAudioTask закрывает одну задачу (экспортированная версия для
 // manager.go — закрытие задачи-стража в конце цикла выгрузки).
+func AudioTasksPending(rootTmp string) int64 {
+	if val, ok := audioTaskCounts.Load(rootTmp); ok {
+		return val.(*audioTaskEntry).count.Load()
+	}
+	return 0
+}
+
+// SendPhotos отправляет картинки раздачи фотоальбомами по 10; большие сканы
+// и форматы, которые Telegram не принимает как фото, пережимаются в JPEG.
+func SendPhotos(c tele.Context, paths []string) error {
+	var lastErr error
+	for start := 0; start < len(paths); start += 10 {
+		end := min(start+10, len(paths))
+		var album tele.Album
+		var temps []string
+		for _, p := range paths[start:end] {
+			prev, temp := coverPreviewFile(p)
+			if temp {
+				temps = append(temps, prev)
+			}
+			album = append(album, &tele.Photo{File: tele.FromDisk(prev), Caption: filepath.Base(p)})
+		}
+		var err error
+		if len(album) == 1 {
+			_, err = c.Bot().Send(c.Recipient(), album[0])
+		} else {
+			_, err = c.Bot().SendAlbum(c.Recipient(), album)
+		}
+		for _, t := range temps {
+			os.Remove(t)
+		}
+		if err != nil {
+			log.Printf("[audio] отправка фото %d–%d: %v", start+1, end, err)
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
 func CompleteAudioTask(rootTmp string) {
 	completeAudioTask(rootTmp)
 }

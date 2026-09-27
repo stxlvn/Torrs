@@ -61,6 +61,8 @@ func Start(token, host string) error {
 	torr.RegisterAudioTasks = RegisterAudioTasks
 	torr.AddAudioTask = AddAudioTask
 	torr.CompleteAudioTask = CompleteAudioTask
+	torr.AudioTasksPending = AudioTasksPending
+	torr.PhotoSender = SendPhotos
 
 	_ = b.SetCommands([]tele.Command{
 		{Text: "start", Description: "Начало работы и справка"},

@@ -36,6 +36,11 @@ var (
 	// пропущен к AudioProcessor как кандидат на нарезку по cue; fallback
 	// (не nil ровно тогда, когда oversized) — откат на LargeFileProcessor
 	// (7z-архивация), если cue в итоге не подтвердится/не найдётся.
+	// AudioTasksPending — число незакрытых аудио-задач папки задачи
+	// (включая задачу-страж); PhotoSender отправляет картинки альбомами.
+	AudioTasksPending func(tmpDir string) int64
+	PhotoSender       func(c tele.Context, paths []string) error
+
 	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string, fileID int, oversized bool, fallback func() error) error
 	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool, kbd *tele.ReplyMarkup) error
 
@@ -546,7 +551,19 @@ func loading(wrk *Worker) {
 		prefetchFolderImages(wrk)
 	}
 
-	iserr := runAllFiles(wrk, totalFiles)
+	var waitAudio func()
+	if hooksReady && AudioTasksPending != nil {
+		waitAudio = func() {
+			touch()
+			for AudioTasksPending(tmpDir) > 1 {
+				if wrk.isCancelled.Load() || time.Since(time.Unix(0, lastActivity.Load())) > audioIdleLimit {
+					return
+				}
+				time.Sleep(2 * time.Second)
+			}
+		}
+	}
+	iserr := runAllFiles(wrk, totalFiles, waitAudio)
 	if iserr {
 		pipelineFailed.Store(true)
 	}
@@ -609,14 +626,66 @@ const pipelineConcurrency = 3
 // живут до конца всей задачи независимо от порядка фаз.
 // Возвращает true, если хотя бы один файл завершился ошибкой (в этом
 // случае пользователю уже отправлено сообщение об ошибке).
-func runAllFiles(wrk *Worker, totalFiles int) bool {
+const (
+	phaseImages = iota
+	phaseAudio
+	phaseCue
+	phaseOther
+)
+
+// filePhase — этап доставки файла: фото, аудио (ISO — тоже: SACD это или
+// нет, видно только после скачивания), cue, всё остальное.
+func filePhase(path string) int {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch {
+	case isImageExt(path):
+		return phaseImages
+	case isAudioExt(path), ext == ".iso":
+		return phaseAudio
+	case ext == ".cue":
+		return phaseCue
+	}
+	return phaseOther
+}
+
+// runAllFiles доставляет файлы задачи по этапам: фото, аудио, cue, прочее.
+// Перед cue и прочими файлами ждёт, пока реально уйдут все треки (меню
+// обложек, нарезка и конвертация идут асинхронно).
+func runAllFiles(wrk *Worker, totalFiles int, waitAudio func()) bool {
 	wrk.reportUploadProgress(totalFiles, 0)
 
+	phases := make([][]int, phaseOther+1)
+	for _, fi := range wrk.fileIndices {
+		p := filePhase(wrk.ti.FileStats[fi].Path)
+		phases[p] = append(phases[p], fi)
+	}
 	var downloaded atomic.Int32
-	if firstErr, firstErrFile := runPipeline(wrk, totalFiles, wrk.fileIndices, &downloaded, &wrk.completedFiles); firstErr != nil {
-		errstr := fmt.Sprintf("Ошибка обработки файла: %v\n\n%v", firstErrFile, firstErr.Error())
-		wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
-		return true
+	waited := false
+	for p, idx := range phases {
+		if len(idx) == 0 || wrk.isCancelled.Load() {
+			continue
+		}
+		if p >= phaseCue && !waited && waitAudio != nil {
+			waitAudio()
+			waited = true
+		}
+		if firstErr, firstErrFile := runPipeline(wrk, totalFiles, idx, &downloaded, &wrk.completedFiles); firstErr != nil {
+			errstr := fmt.Sprintf("Ошибка обработки файла: %v\n\n%v", firstErrFile, firstErr.Error())
+			wrk.c.Bot().Edit(wrk.msg, errstr, tele.ModeHTML)
+			return true
+		}
+		if p == phaseImages && PhotoSender != nil && AudioProcessor != nil {
+			var paths []string
+			for _, fi := range idx {
+				full := filepath.Join(wrk.tmpDir, strings.TrimPrefix(wrk.ti.FileStats[fi].Path, "/"))
+				if _, err := os.Stat(full); err == nil {
+					paths = append(paths, full)
+				}
+			}
+			if err := PhotoSender(wrk.c, paths); err != nil {
+				log.Printf("[manager] worker=%d: отправка фото: %v", wrk.id, err)
+			}
+		}
 	}
 	return false
 }
