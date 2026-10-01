@@ -58,10 +58,12 @@ func GetTorrentInfo(hash string) (*state.TorrentStatus, error) {
 	return ti, err
 }
 
+var infoHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 func fetchTorrentInfo(hash string) (*state.TorrentStatus, error) {
 	link := global.TSHost + "/stream?stat&link=" + url.QueryEscape(hash)
 	start := time.Now()
-	resp, err := http.Get(link)
+	resp, err := infoHTTPClient.Get(link)
 	if err != nil {
 		log.Printf("[torrent] fetchTorrentInfo(%s): FAILED after %v: %v", hash, time.Since(start), err)
 		return nil, err
