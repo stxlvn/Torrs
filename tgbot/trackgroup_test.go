@@ -2,6 +2,8 @@ package tgbot
 
 import (
 	"fmt"
+	"os"
+	"sync"
 	"math/rand"
 	"strings"
 	"testing"
@@ -101,4 +103,25 @@ func TestTrackGroupingWaitsForEarlierProducer(t *testing.T) {
 	if len(sent) != 2 || strings.Join(sent[1], ",") != "11,12,13,14" {
 		t.Fatalf("остаток: %v", sent)
 	}
+}
+
+func TestAbortAudioTasks(t *testing.T) {
+	root := t.TempDir() + "/torrdl_x"
+	os.MkdirAll(root+"/Album", 0o755)
+	RegisterAudioTasks(root, 1, func() { t.Fatal("onDone при отмене") }, nil, nil)
+	AddAudioTask(root, 100)
+	pendingCuelessFiles.Store("1_h_f", &pendingCuelessFile{cueFileCtx: cueFileCtx{AudioPath: root + "/Album/a.flac", RootTmp: root}})
+	pendingCueGroups.Store("1_h_g", &PendingCueGroup{Dir: root + "/Album"})
+	enqueueTrack(nil, root, root+"/Album", readyTrack{Title: "x"})
+	AbortAudioTasks(root)
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatal("папка задачи не удалена")
+	}
+	if AudioTasksPending(root) != 0 {
+		t.Fatal("задачи остались")
+	}
+	for _, m := range []*sync.Map{&pendingCuelessFiles, &pendingCueGroups, &trackQueues} {
+		m.Range(func(k, _ any) bool { t.Fatalf("осталось ожидание %v", k); return false })
+	}
+	AbortAudioTasks(root)
 }

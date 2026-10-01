@@ -1,11 +1,13 @@
 package torr
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"torrsru/tgbot/torr/state"
 )
@@ -66,16 +68,47 @@ func prefetchCueSheets(wrk *Worker) {
 // вне учёта wrk.downloadedBytes/fileIndices, т.к. это служебный файл, а не
 // часть задачи, которую нужно показывать в прогрессе или выгружать в чат
 // как есть.
+func readTorrFileOnce(wrk *Worker, f *state.TorrentFileStat) ([]byte, error) {
+	torrFile, err := NewTorrFile(wrk, f)
+	if err != nil {
+		return nil, err
+	}
+	defer torrFile.Close()
+	return io.ReadAll(torrFile)
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return len(b) > 0
+}
+
+// fetchCueToTmp скачивает .cue; при повторном добавлении торрента сразу
+// после отмены TorrServer отдавал маленькие файлы нулями — такой ответ
+// перезапрашивается.
 func fetchCueToTmp(wrk *Worker, cueFile *state.TorrentFileStat) error {
-	torrFile, err := NewTorrFile(wrk, cueFile)
+	var data []byte
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		data, err = readTorrFileOnce(wrk, cueFile)
+		if err == nil && !allZero(data) {
+			break
+		}
+		reason := "получены одни нули"
+		if err != nil {
+			reason = err.Error()
+		}
+		log.Printf("[cue] %q: попытка %d/5 — %s, повтор", cueFile.Path, attempt, reason)
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+	}
 	if err != nil {
 		return err
 	}
-	defer torrFile.Close()
-
-	data, err := io.ReadAll(torrFile)
-	if err != nil {
-		return err
+	if allZero(data) {
+		return fmt.Errorf("TorrServer отдал вместо cue одни нули")
 	}
 
 	relPath := strings.TrimPrefix(cueFile.Path, "/")

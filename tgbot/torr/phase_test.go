@@ -39,3 +39,9 @@ func TestFormatETA(t *testing.T) {
 		}
 	}
 }
+
+func TestAllZero(t *testing.T) {
+	if !allZero(make([]byte, 1517)) || allZero([]byte("FILE")) || allZero(nil) {
+		t.Fatal("allZero")
+	}
+}

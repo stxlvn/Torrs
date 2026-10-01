@@ -359,6 +359,71 @@ func completeAudioTask(rootTmp string) {
 	}
 }
 
+var theBot *tele.Bot
+
+// AbortAudioTasks снимает все незавершённые аудио-задачи папки задачи
+// (отмена или брошенные меню): убирает меню и удаляет временную папку.
+func AbortAudioTasks(rootTmp string) {
+	if _, ok := audioTaskCounts.LoadAndDelete(rootTmp); !ok {
+		return
+	}
+	audioFolderCounts.Delete(rootTmp)
+	drop := func(msgs ...*tele.Message) {
+		for _, m := range msgs {
+			if m != nil && theBot != nil {
+				theBot.Delete(m)
+			}
+		}
+	}
+	inTask := func(p string) bool { return p == rootTmp || strings.HasPrefix(p, rootTmp+"/") }
+	pendingCovers.Range(func(k, v any) bool {
+		if pc := v.(*PendingCover); pc.RootTmp == rootTmp {
+			pendingCovers.Delete(k)
+			pc.mu.Lock()
+			drop(pc.PickerMsgs...)
+			pc.mu.Unlock()
+		}
+		return true
+	})
+	pendingCueSplits.Range(func(k, v any) bool {
+		if p := v.(*PendingCueSplit); p.RootTmp == rootTmp {
+			pendingCueSplits.Delete(k)
+			drop(p.PickerMsg)
+		}
+		return true
+	})
+	pendingCuelessFiles.Range(func(k, v any) bool {
+		if p := v.(*pendingCuelessFile); p.RootTmp == rootTmp {
+			pendingCuelessFiles.Delete(k)
+			drop(p.PickerMsg)
+		}
+		return true
+	})
+	pendingCueGroups.Range(func(k, v any) bool {
+		if g := v.(*PendingCueGroup); inTask(g.Dir) {
+			pendingCueGroups.Delete(k)
+			g.mu.Lock()
+			drop(g.PickerMsg)
+			g.mu.Unlock()
+		}
+		return true
+	})
+	pendingSACD.Range(func(k, v any) bool {
+		if v.(cueFileCtx).RootTmp == rootTmp {
+			pendingSACD.Delete(k)
+		}
+		return true
+	})
+	trackQueues.Range(func(k, _ any) bool {
+		if strings.HasPrefix(k.(string), rootTmp+"\x00") {
+			trackQueues.Delete(k)
+		}
+		return true
+	})
+	os.RemoveAll(rootTmp)
+	log.Printf("[audio] %s: незавершённые аудио-задачи сняты, временная папка удалена", rootTmp)
+}
+
 // ProcessAudioFile — точка входа AudioProcessor. oversized=true означает,
 // что manager.go пропустил файл сюда В ОБХОД порога safePartSize только
 // потому, что рядом нашёлся .cue (см. isCueSplitCandidate/hasSiblingCueFile

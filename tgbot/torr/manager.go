@@ -41,6 +41,7 @@ var (
 	AudioTasksPending func(tmpDir string) int64
 	PhotoSender       func(c tele.Context, paths []string) error
 	FlushTracks       func(tmpDir string)
+	AbortAudioTasks   func(tmpDir string)
 
 	AudioProcessor     func(c tele.Context, filePath string, hash string, tmpDir string, fileID int, oversized bool, fallback func() error) error
 	LargeFileProcessor func(c tele.Context, filePath string, fileSize int64, fileName string, hash string, statusMsg *tele.Message, isCancelled func() bool, kbd *tele.ReplyMarkup) error
@@ -578,6 +579,10 @@ func loading(wrk *Worker) {
 // меню обложки/cue), прежде чем отпустить следующую задачу.
 const audioIdleLimit = 20 * time.Minute
 
+// abandonedTaskTTL — через сколько после отпускания очереди удаляется папка
+// задачи, меню которой так и остались без ответа.
+const abandonedTaskTTL = 6 * time.Hour
+
 // waitAudioTasks закрывает задачу-страж и ждёт, пока реально отправятся все
 // треки: нарезка, конвертация и доставка идут асинхронно после ответа на
 // меню, и без ожидания следующая раздача шла бы вперемешку с этой.
@@ -585,7 +590,16 @@ func waitAudioTasks(wrk *Worker, tmpDir string, finished chan struct{}, lastActi
 	if AudioTasksPending != nil {
 		lastActivity.Store(time.Now().UnixNano())
 		for AudioTasksPending(tmpDir) > 1 {
-			if wrk.isCancelled.Load() || time.Since(time.Unix(0, lastActivity.Load())) > audioIdleLimit {
+			if wrk.isCancelled.Load() {
+				if AbortAudioTasks != nil {
+					AbortAudioTasks(tmpDir)
+				}
+				return
+			}
+			if time.Since(time.Unix(0, lastActivity.Load())) > audioIdleLimit {
+				if AbortAudioTasks != nil {
+					time.AfterFunc(abandonedTaskTTL, func() { AbortAudioTasks(tmpDir) })
+				}
 				break
 			}
 			time.Sleep(2 * time.Second)
@@ -603,6 +617,9 @@ func waitAudioTasks(wrk *Worker, tmpDir string, finished chan struct{}, lastActi
 			return
 		case <-tick.C:
 			if wrk.isCancelled.Load() {
+				if AbortAudioTasks != nil {
+					AbortAudioTasks(tmpDir)
+				}
 				return
 			}
 			if idle := time.Since(time.Unix(0, lastActivity.Load())); idle > audioIdleLimit {
