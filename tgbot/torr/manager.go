@@ -130,14 +130,24 @@ type Worker struct {
 	// audioStage — текущий этап асинхронной аудио-обработки (нарезка по
 	// cue, извлечение SACD), показывается отдельным блоком статуса.
 	audioStage atomic.Value
+	// prefetchStage — что сейчас заранее скачивается (обложки, cue).
+	prefetchStage atomic.Value
+}
+
+func (wrk *Worker) setPrefetchStage(text string) {
+	wrk.prefetchStage.Store(text)
+	wrk.reportUploadProgress(len(wrk.fileIndices), int(wrk.completedFiles.Load()))
 }
 
 func (wrk *Worker) audioStageBlock() string {
-	stage, _ := wrk.audioStage.Load().(string)
-	if stage == "" {
-		return ""
+	block := ""
+	if pre, _ := wrk.prefetchStage.Load().(string); pre != "" {
+		block += "📥 <b>Предзагрузка:</b>\n" + pre + "\n\n"
 	}
-	return "🎛 <b>Обработка аудио:</b>\n" + stage + "\n\n"
+	if stage, _ := wrk.audioStage.Load().(string); stage != "" {
+		block += "🎛 <b>Обработка аудио:</b>\n" + stage + "\n\n"
+	}
+	return block
 }
 
 // throttleStatusUpdate возвращает true не чаще, чем раз в minInterval —

@@ -1,11 +1,15 @@
 package torr
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/dustin/go-humanize"
 
 	"torrsru/tgbot/torr/state"
 )
@@ -57,6 +61,7 @@ func prefetchFolderImages(wrk *Worker) {
 		}
 	}
 
+	defer wrk.setPrefetchStage("")
 	for _, imgFile := range imageFiles {
 		if wrk.isCancelled.Load() {
 			return
@@ -92,11 +97,36 @@ func fetchImageToTmp(wrk *Worker, imgFile *state.TorrentFileStat) error {
 	}
 	defer out.Close()
 
-	n, err := io.Copy(out, torrFile)
+	pw := &prefetchProgress{wrk: wrk, name: filepath.Base(relPath), total: imgFile.Length, start: time.Now()}
+	n, err := io.Copy(io.MultiWriter(out, pw), torrFile)
 	if err != nil {
 		os.Remove(fullPath)
 		return err
 	}
 	log.Printf("[audio] заранее скачана картинка %q (%d байт) -> %s", imgFile.Path, n, fullPath)
 	return nil
+}
+
+// prefetchProgress показывает в статусе ход предзагрузки большого файла —
+// на медленной раздаче скан в сотню мегабайт качается минутами, и без
+// этого задача выглядит зависшей.
+type prefetchProgress struct {
+	wrk   *Worker
+	name  string
+	total int64
+	done  int64
+	start time.Time
+	last  time.Time
+}
+
+func (p *prefetchProgress) Write(b []byte) (int, error) {
+	p.done += int64(len(b))
+	if time.Since(p.last) >= 3*time.Second {
+		p.last = time.Now()
+		speed := float64(p.done) / time.Since(p.start).Seconds()
+		p.wrk.setPrefetchStage(fmt.Sprintf("%s — %s / %s, %s/s, осталось %s", p.name,
+			humanize.Bytes(uint64(p.done)), humanize.Bytes(uint64(p.total)), humanize.Bytes(uint64(speed)),
+			formatETA(float64(p.total-p.done), speed)))
+	}
+	return len(b), nil
 }
