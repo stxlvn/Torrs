@@ -1,6 +1,7 @@
 package torr
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -57,6 +58,9 @@ func prefetchCueSheets(wrk *Worker) {
 	}
 
 	for _, cueFile := range cueFiles {
+		if wrk.isCancelled.Load() {
+			return
+		}
 		if err := fetchCueToTmp(wrk, cueFile); err != nil {
 			log.Printf("[cue] не удалось скачать %q: %v", cueFile.Path, err)
 		}
@@ -96,6 +100,9 @@ func fetchCueToTmp(wrk *Worker, cueFile *state.TorrentFileStat) error {
 		data, err = readTorrFileOnce(wrk, cueFile)
 		if err == nil && !allZero(data) {
 			break
+		}
+		if wrk.isCancelled.Load() || errors.Is(err, ERR_STOPPED) {
+			return ERR_STOPPED
 		}
 		reason := "получены одни нули"
 		if err != nil {

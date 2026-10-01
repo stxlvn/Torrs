@@ -189,7 +189,7 @@ func (m *Manager) AddRange(c tele.Context, hash string, from, to int) {
 	// в цикле loading() в отдельной горутине, и конкурентный append сюда
 	// был бы гонкой данных — поэтому просто игнорируем дубликат.
 	for _, w := range m.working {
-		if w.torrentHash == hash && w.c.Sender().ID == c.Sender().ID {
+		if w.torrentHash == hash && w.c.Sender().ID == c.Sender().ID && !w.isCancelled.Load() {
 			log.Printf("[manager] AddRange: hash=%s user=%d уже обрабатывается worker=%d — повторный запрос проигнорирован (вероятно, повторно доставленное обновление Telegram)", hash, c.Sender().ID, w.id)
 			return
 		}

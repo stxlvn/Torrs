@@ -58,6 +58,9 @@ func prefetchFolderImages(wrk *Worker) {
 	}
 
 	for _, imgFile := range imageFiles {
+		if wrk.isCancelled.Load() {
+			return
+		}
 		if err := fetchImageToTmp(wrk, imgFile); err != nil {
 			log.Printf("[audio] не удалось заранее скачать картинку %q: %v", imgFile.Path, err)
 		}
