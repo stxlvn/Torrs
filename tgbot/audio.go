@@ -272,30 +272,48 @@ func AudioTasksPending(rootTmp string) int64 {
 // SendPhotos отправляет картинки раздачи фотоальбомами по 10; большие сканы
 // и форматы, которые Telegram не принимает как фото, пережимаются в JPEG.
 func SendPhotos(c tele.Context, paths []string) error {
-	var lastErr error
-	for start := 0; start < len(paths); start += 10 {
-		end := min(start+10, len(paths))
-		var album tele.Album
-		var temps []string
-		for _, p := range paths[start:end] {
-			prev, temp := coverPreviewFile(p)
-			if temp {
-				temps = append(temps, prev)
-			}
-			album = append(album, &tele.Photo{File: tele.FromDisk(prev), Caption: filepath.Base(p)})
-		}
-		var err error
-		if len(album) == 1 {
-			_, err = c.Bot().Send(c.Recipient(), album[0])
-		} else {
-			_, err = c.Bot().SendAlbum(c.Recipient(), album)
-		}
+	type photo struct{ src, file string }
+	var photos []photo
+	var temps []string
+	defer func() {
 		for _, t := range temps {
 			os.Remove(t)
 		}
-		if err != nil {
-			log.Printf("[audio] отправка фото %d–%d: %v", start+1, end, err)
+	}()
+	for _, p := range paths {
+		if st, err := os.Stat(p); err != nil || st.Size() == 0 {
+			log.Printf("[audio] фото %s пропущено: пустой или недоступный файл", filepath.Base(p))
+			continue
+		}
+		prev, temp := coverPreviewFile(p)
+		if temp {
+			temps = append(temps, prev)
+		}
+		photos = append(photos, photo{src: p, file: prev})
+	}
+
+	var lastErr error
+	sendOne := func(ph photo) {
+		if _, err := c.Bot().Send(c.Recipient(), &tele.Photo{File: tele.FromDisk(ph.file), Caption: filepath.Base(ph.src)}); err != nil {
+			log.Printf("[audio] фото %s не отправлено: %v", filepath.Base(ph.src), err)
 			lastErr = err
+		}
+	}
+	for start := 0; start < len(photos); start += 10 {
+		chunk := photos[start:min(start+10, len(photos))]
+		if len(chunk) == 1 {
+			sendOne(chunk[0])
+			continue
+		}
+		var album tele.Album
+		for _, ph := range chunk {
+			album = append(album, &tele.Photo{File: tele.FromDisk(ph.file), Caption: filepath.Base(ph.src)})
+		}
+		if _, err := c.Bot().SendAlbum(c.Recipient(), album); err != nil {
+			log.Printf("[audio] альбом фото %d–%d не отправлен (%v), шлю по одному", start+1, start+len(chunk), err)
+			for _, ph := range chunk {
+				sendOne(ph)
+			}
 		}
 	}
 	return lastErr

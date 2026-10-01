@@ -124,5 +124,11 @@ func fetchCueToTmp(wrk *Worker, cueFile *state.TorrentFileStat) error {
 		return err
 	}
 	log.Printf("[cue] найден cue-sheet %q, скачано %d байт -> %s", cueFile.Path, len(data), fullPath)
-	return os.WriteFile(fullPath, data, 0644)
+	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+		return err
+	}
+	if int64(len(data)) == cueFile.Length {
+		markPrefetched(wrk, cueFile)
+	}
+	return nil
 }

@@ -1,6 +1,10 @@
 package torr
 
-import "testing"
+import (
+	"testing"
+
+	"torrsru/tgbot/torr/state"
+)
 
 func TestFilePhase(t *testing.T) {
 	cases := map[string]int{
@@ -43,5 +47,19 @@ func TestFormatETA(t *testing.T) {
 func TestAllZero(t *testing.T) {
 	if !allZero(make([]byte, 1517)) || allZero([]byte("FILE")) || allZero(nil) {
 		t.Fatal("allZero")
+	}
+}
+
+func TestPrefetchCountedOnce(t *testing.T) {
+	ti := &state.TorrentStatus{FileStats: []*state.TorrentFileStat{
+		{Id: 1, Path: "A/Scans/Back.png", Length: 100},
+		{Id: 2, Path: "A/Scans/Unselected.png", Length: 50},
+	}}
+	wrk := &Worker{ti: ti, fileIndices: []int{0}}
+	markPrefetched(wrk, ti.FileStats[0])
+	markPrefetched(wrk, ti.FileStats[0])
+	markPrefetched(wrk, ti.FileStats[1])
+	if got := wrk.downloadedBytes.Load(); got != 100 {
+		t.Fatalf("засчитано %d байт, ожидалось 100", got)
 	}
 }

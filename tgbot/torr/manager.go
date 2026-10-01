@@ -130,20 +130,22 @@ type Worker struct {
 	// audioStage — текущий этап асинхронной аудио-обработки (нарезка по
 	// cue, извлечение SACD), показывается отдельным блоком статуса.
 	audioStage atomic.Value
-	// prefetchStage — что сейчас заранее скачивается (обложки, cue).
-	prefetchStage atomic.Value
+	// prefetched — выбранные файлы, уже скачанные заранее (обложки, cue) и
+	// учтённые в downloadedBytes.
+	prefetched sync.Map
 }
 
-func (wrk *Worker) setPrefetchStage(text string) {
-	wrk.prefetchStage.Store(text)
-	wrk.reportUploadProgress(len(wrk.fileIndices), int(wrk.completedFiles.Load()))
+func (wrk *Worker) isSelected(fileID int) bool {
+	for _, fi := range wrk.fileIndices {
+		if wrk.ti.FileStats[fi].Id == fileID {
+			return true
+		}
+	}
+	return false
 }
 
 func (wrk *Worker) audioStageBlock() string {
 	block := ""
-	if pre, _ := wrk.prefetchStage.Load().(string); pre != "" {
-		block += "📥 <b>Предзагрузка:</b>\n" + pre + "\n\n"
-	}
 	if stage, _ := wrk.audioStage.Load().(string); stage != "" {
 		block += "🎛 <b>Обработка аудио:</b>\n" + stage + "\n\n"
 	}
@@ -1051,14 +1053,15 @@ func downloadFileToDisk(wrk *Worker, file *state.TorrentFileStat, fi, fc int) (s
 	// сама картинка перечислена в торренте ПОСЛЕ аудио. Если файл уже на
 	// месте и нужного размера — не качаем повторно, просто досчитываем
 	// прогресс и отдаём путь как обычно.
-	if isImageExt(file.Path) {
+	if _, ok := wrk.prefetched.Load(file.Path); ok {
 		relPath := strings.TrimPrefix(file.Path, "/")
 		fullPath := filepath.Join(wrk.tmpDir, relPath)
 		if info, statErr := os.Stat(fullPath); statErr == nil && info.Size() == file.Length {
 			log.Printf("[manager] downloadFileToDisk: %q уже скачан заранее, повторное скачивание пропущено", file.Path)
-			wrk.downloadedBytes.Add(file.Length)
 			return fullPath, nil
 		}
+		wrk.prefetched.Delete(file.Path)
+		wrk.downloadedBytes.Add(-file.Length)
 	}
 
 	var lastErr error
@@ -1134,7 +1137,10 @@ func downloadFileToDiskOnce(wrk *Worker, file *state.TorrentFileStat, fi, fc int
 	// снижает их число и ускоряет копирование заметно дороже, чем можно
 	// было бы ожидать от "всего лишь" локальной передачи.
 	copyBuf := make([]byte, 1<<20) // 1 МБ
-	_, copyErr := io.CopyBuffer(tmpFile, torrFile, copyBuf)
+	written, copyErr := io.CopyBuffer(tmpFile, torrFile, copyBuf)
+	if copyErr == nil && written != file.Length {
+		copyErr = fmt.Errorf("получено %d байт из %d", written, file.Length)
+	}
 	complete.Store(true)
 	wa.Wait()
 

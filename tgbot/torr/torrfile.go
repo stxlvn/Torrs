@@ -2,6 +2,7 @@ package torr
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -57,6 +58,10 @@ func NewTorrFile(wrk *Worker, tfile *state.TorrentFileStat) (*TorrFile, error) {
 		return nil, err
 	}
 	log.Printf("[torrfile] NewTorrFile: %s (index=%d): поток открыт, status=%s size=%d", tf.name, tfile.Id, resp.Status, tf.size)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("TorrServer ответил %s", resp.Status)
+	}
 	tf.resp = resp
 	return tf, nil
 }

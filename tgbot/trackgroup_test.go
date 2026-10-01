@@ -2,10 +2,10 @@ package tgbot
 
 import (
 	"fmt"
-	"os"
-	"sync"
 	"math/rand"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	tele "gopkg.in/telebot.v4"
