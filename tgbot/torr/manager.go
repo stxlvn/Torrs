@@ -1409,7 +1409,6 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 		return
 	}
 
-	wait := formatETA(float64(file.Loaded()), ti.DownloadSpeed)
 	speed := humanize.Bytes(uint64(ti.DownloadSpeed)) + "/sec"
 	peers := fmt.Sprintf("%v (%v/%v)", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
 
@@ -1426,6 +1425,12 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 	if globalPercent > 100.0 {
 		globalPercent = 100.0
 	}
+
+	remaining := totalBytes - downloadedNow
+	if remaining < file.Loaded() {
+		remaining = file.Loaded()
+	}
+	wait := formatETA(float64(remaining), ti.DownloadSpeed)
 
 	downloadedStr := humanize.Bytes(uint64(downloadedNow))
 	totalStr := humanize.Bytes(uint64(totalBytes))
