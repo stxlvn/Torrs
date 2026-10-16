@@ -295,8 +295,12 @@ func SendPhotos(c tele.Context, paths []string) error {
 	var lastErr error
 	sendOne := func(ph photo) {
 		if _, err := c.Bot().Send(c.Recipient(), &tele.Photo{File: tele.FromDisk(ph.file), Caption: filepath.Base(ph.src)}); err != nil {
-			log.Printf("[audio] фото %s не отправлено: %v", filepath.Base(ph.src), err)
-			lastErr = err
+			log.Printf("[audio] фото %s не отправлено (%v), шлю файлом", filepath.Base(ph.src), err)
+			doc := &tele.Document{File: tele.FromDisk(ph.src), FileName: filepath.Base(ph.src)}
+			if _, err := c.Bot().Send(c.Recipient(), doc); err != nil {
+				log.Printf("[audio] %s не отправлен и файлом: %v", filepath.Base(ph.src), err)
+				lastErr = err
+			}
 		}
 	}
 	for start := 0; start < len(photos); start += 10 {
