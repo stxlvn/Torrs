@@ -419,8 +419,11 @@ func (m *Manager) queueSnapshotLocked() []queueStatusItem {
 func sendQueueStatusSnapshot(snapshot []queueStatusItem) {
 	for _, item := range snapshot {
 		torrKbd := &tele.ReplyMarkup{}
-		torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(item.id)))}...)
+		torrKbd.Inline([]tele.Row{torrKbd.Row(cancelButton(torrKbd, item.id))}...)
 
+		if editRich(item.c.Bot(), item.msg, queueStatusRich(item), cancelMarkupJSON(item.id)) {
+			continue
+		}
 		msg := "⏳ <b>Очередь</b> (позиция " + strconv.Itoa(item.position) + ")\n"
 		msg += "📦 <b>Файлов к обработке:</b> " + strconv.Itoa(item.fileCount) + "\n"
 		msg += "⚙️ <code>" + item.torrentHash + "</code>"
@@ -485,7 +488,9 @@ func loading(wrk *Worker) {
 		// удаляется — иначе оно так и осталось бы висеть в чате навсегда
 		// с неактуальными цифрами.
 		wrk.c.Bot().Delete(wrk.msg)
-		wrk.c.Bot().Send(wrk.c.Recipient(), summary, tele.ModeHTML)
+		if !sendRich(wrk.c.Bot(), wrk.c.Recipient().Recipient(), wrk.summaryRich(totalFiles)) {
+			wrk.c.Bot().Send(wrk.c.Recipient(), summary, tele.ModeHTML)
+		}
 	}
 
 	// onProgress — промежуточный статус долгих интерактивных задач (сейчас
@@ -941,59 +946,12 @@ func (wrk *Worker) reportUploadProgress(totalFiles, completedFiles int) {
 		return
 	}
 
-	uploaded := wrk.uploadedBytes.Load()
-	totalBytes := wrk.totalBytes
-	percent := 0.0
-	if totalBytes > 0 {
-		percent = float64(uploaded) / float64(totalBytes) * 100.0
-	}
-	if percent > 100.0 {
-		percent = 100.0
-	}
-
 	ti, _ := GetTorrentInfo(wrk.torrentHash)
 	title := wrk.torrentHash
 	if ti != nil && ti.Title != "" {
 		title = ti.Title
 	}
-
-	msg := "🚀 <b>Обработка торрента...</b>\n\n"
-	msg += "💿 <b>Название:</b> " + title + "\n"
-	if totalFiles > 1 {
-		msg += "📦 <b>Файлы:</b> " + strconv.Itoa(completedFiles) + " из " + strconv.Itoa(totalFiles) + "\n\n"
-	} else {
-		msg += "\n"
-	}
-	// Реальный прогресс скачивания (а не захардкоженные "100%, завершено")
-	// — конвейер выгружает уже скачанные файлы, пока следующие ещё
-	// качаются, так что скачивание всей задачи в этот момент может быть
-	// ещё не завершено. wrk.downloadedBytes — тот же счётчик, что
-	// использует updateDownloadStatus.
-	downloadedNow := wrk.downloadedBytes.Load()
-	downloadPercent := 0.0
-	if totalBytes > 0 {
-		downloadPercent = float64(downloadedNow) / float64(totalBytes) * 100.0
-	}
-	if downloadPercent > 100.0 {
-		downloadPercent = 100.0
-	}
-
-	msg += "📥 <b>Скачивание на сервер:</b>\n"
-	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(downloadPercent), downloadPercent)
-	if downloadPercent >= 100.0 {
-		msg += "✅ <i>Успешно завершено</i>\n\n"
-	} else {
-		msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(downloadedNow)), humanize.Bytes(uint64(totalBytes)))
-	}
-	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
-	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(percent), percent)
-	msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(uploaded)), humanize.Bytes(uint64(totalBytes)))
-	msg += wrk.audioStageBlock()
-	msg += "⚙️ <code>" + wrk.torrentHash + "</code>"
-
-	torrKbd := &tele.ReplyMarkup{}
-	torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
-	wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
+	wrk.showStatus(wrk.baseStatusView(title, completedFiles, totalFiles))
 }
 
 func IsImageExt(path string) bool {
@@ -1219,7 +1177,7 @@ func uploadFileFromDisk(wrk *Worker, file *state.TorrentFileStat, diskPath strin
 		// чего оно оставалось nil и первый же Edit внутри архивации стирал
 		// кнопку "Отмена" с реального сообщения в Telegram.
 		torrKbd := &tele.ReplyMarkup{}
-		torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
+		torrKbd.Inline([]tele.Row{torrKbd.Row(cancelButton(torrKbd, wrk.id))}...)
 		return func() error {
 			return LargeFileProcessor(wrk.c, diskPath, file.Length, file.Path, wrk.torrentHash, wrk.msg, wrk.isCancelled.Load, torrKbd)
 		}
@@ -1409,77 +1367,26 @@ func updateDownloadStatus(wrk *Worker, file *TorrFile, fi, fc int, force bool) {
 		return
 	}
 
-	speed := humanize.Bytes(uint64(ti.DownloadSpeed)) + "/sec"
-	peers := fmt.Sprintf("%v (%v/%v)", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
-
-	// Совокупный прогресс по ВСЕЙ задаче: байты уже полностью скачанных
-	// файлов + live-прогресс текущего файла. Раньше здесь показывался
-	// только процент/размер текущего файла — при закачке альбома из 10
-	// треков пользователь не видел общий прогресс по всем 10 сразу.
-	totalBytes := wrk.totalBytes
 	downloadedNow := wrk.downloadedBytes.Load() + file.offset
-	globalPercent := 0.0
-	if totalBytes > 0 {
-		globalPercent = float64(downloadedNow) / float64(totalBytes) * 100.0
-	}
-	if globalPercent > 100.0 {
-		globalPercent = 100.0
-	}
-
-	remaining := totalBytes - downloadedNow
+	remaining := wrk.totalBytes - downloadedNow
 	if remaining < file.Loaded() {
 		remaining = file.Loaded()
 	}
-	wait := formatETA(float64(remaining), ti.DownloadSpeed)
 
-	downloadedStr := humanize.Bytes(uint64(downloadedNow))
-	totalStr := humanize.Bytes(uint64(totalBytes))
+	v := wrk.baseStatusView(ti.Title, fi, fc)
+	v.Hash = file.hash
+	v.DownDone = downloadedNow
+	v.DownloadPhase = true
+	v.DownFinalizing = file.offset >= file.size
+	v.Speed = humanize.Bytes(uint64(ti.DownloadSpeed)) + "/с"
+	v.Peers = fmt.Sprintf("%v (%v/%v)", ti.ConnectedSeeders, ti.ActivePeers, ti.TotalPeers)
+	v.ETA = formatETA(float64(remaining), ti.DownloadSpeed)
+	v.UpWaiting = v.UpDone == 0
+	wrk.showStatus(v)
+}
 
-	msg := "🚀 <b>Обработка торрента...</b>\n\n"
-	msg += "💿 <b>Название:</b> " + ti.Title + "\n"
-	if fc > 1 {
-		msg += "📦 <b>Файлы:</b> " + strconv.Itoa(fi) + " из " + strconv.Itoa(fc) + "\n\n"
-	} else {
-		msg += "\n"
-	}
-
-	msg += "📥 <b>Скачивание на сервер:</b>\n"
-	if file.offset < file.size {
-		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
-		msg += fmt.Sprintf("Данные: %s / %s\n", downloadedStr, totalStr)
-		msg += fmt.Sprintf("Скорость: %s | Пиры: %s\n", speed, peers)
-		msg += fmt.Sprintf("Осталось: %s\n\n", wait)
-	} else {
-		msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(globalPercent), globalPercent)
-		msg += "⏳ <i>Финализация файла...</i>\n\n"
-	}
-
-	// Реальный прогресс выгрузки (а не захардкоженный "0%, ожидание") —
-	// конвейер (см. runPipeline) выгружает уже скачанные файлы конкурентно
-	// со скачиванием следующих, так что к этому моменту какие-то файлы
-	// вполне могут быть уже выгружены. wrk.uploadedBytes — тот же счётчик,
-	// что использует reportUploadProgress.
-	uploadedNow := wrk.uploadedBytes.Load()
-	uploadPercent := 0.0
-	if totalBytes > 0 {
-		uploadPercent = float64(uploadedNow) / float64(totalBytes) * 100.0
-	}
-	if uploadPercent > 100.0 {
-		uploadPercent = 100.0
-	}
-
-	msg += "📤 <b>Выгрузка в Telegram:</b>\n"
-	msg += fmt.Sprintf("Прогресс: [%s] %.2f%%\n", GetProgressBar(uploadPercent), uploadPercent)
-	if uploadedNow > 0 {
-		msg += fmt.Sprintf("Данные: %s / %s\n\n", humanize.Bytes(uint64(uploadedNow)), totalStr)
-	} else {
-		msg += "⏳ <i>Ожидание скачивания файлов...</i>\n\n"
-	}
-
-	msg += wrk.audioStageBlock()
-	msg += "⚙️ <code>" + file.hash + "</code>"
-
-	torrKbd := &tele.ReplyMarkup{}
-	torrKbd.Inline([]tele.Row{torrKbd.Row(torrKbd.Data("Отмена", "cancel", strconv.Itoa(wrk.id)))}...)
-	wrk.c.Bot().Edit(wrk.msg, msg, torrKbd, tele.ModeHTML)
+func cancelButton(kbd *tele.ReplyMarkup, id int) tele.Btn {
+	b := kbd.Data("❌ Отмена", "cancel", strconv.Itoa(id))
+	b.Style = tele.ButtonStyleDanger
+	return b
 }

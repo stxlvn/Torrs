@@ -42,7 +42,7 @@ func processSACD(c tele.Context, fc cueFileCtx) error {
 	}
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(
-		markup.Row(markup.Data("🎼 Извлечь треки", "\fsacdx", fc.Hash, fc.fileHash())),
+		markup.Row(styled(markup.Data("🎼 Извлечь треки", "\fsacdx", fc.Hash, fc.fileHash()), tele.ButtonStyleSuccess)),
 		markup.Row(markup.Data(skipLabel(true, false), "\fsacdarc", fc.Hash, fc.fileHash())),
 	)
 	text := fmt.Sprintf("💿 <b>%s</b>%s — образ SACD.\n\nИзвлечь треки? DSD будет переведён в PCM 24 бит без потери слышимого диапазона и придёт FLAC-файлами с названиями с диска.",

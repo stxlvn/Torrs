@@ -265,6 +265,9 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 			}
 			btnText := status + item.Name + " (" + humanize.Bytes(uint64(item.Size)) + ")"
 			btn := filesKbd.Data(btnText, "\ftog", ti.Hash, strconv.Itoa(item.FileID))
+			if item.Selected {
+				btn.Style = tele.ButtonStylePrimary
+			}
 			rows = append(rows, filesKbd.Row(btn))
 		} else {
 			// Хэш для пути папки (чтобы влезть в callback_data), скопирован
@@ -283,6 +286,9 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 				checkIcon = "🟩"
 			}
 			btnToggle := filesKbd.Data(checkIcon, "\ftogd", ti.Hash, dirHash)
+			if isFullySelected {
+				btnToggle.Style = tele.ButtonStylePrimary
+			}
 
 			rows = append(rows, filesKbd.Row(btnFolder, btnToggle))
 		}
@@ -303,11 +309,11 @@ func renderTorrentPage(c tele.Context, ti *state.TorrentStatus) error {
 	rows = append(rows, navRow)
 
 	// Панель управления
-	btnDown := filesKbd.Data("📥 Скачать выбранное", "\fdown", ti.Hash)
+	btnDown := styled(filesKbd.Data("📥 Скачать выбранное", "\fdown", ti.Hash), tele.ButtonStyleSuccess)
 	rows = append(rows, filesKbd.Row(btnDown))
 
 	btnAllDir := filesKbd.Data("🚀 Скачать эту папку", "\fdall", ti.Hash)
-	btnCancel := filesKbd.Data("❌ Отмена", "\fcanc", ti.Hash)
+	btnCancel := styled(filesKbd.Data("❌ Отмена", "\fcanc", ti.Hash), tele.ButtonStyleDanger)
 	rows = append(rows, filesKbd.Row(btnAllDir, btnCancel))
 
 	filesKbd.Inline(rows...)
@@ -718,4 +724,9 @@ func isHash(txt string) bool {
 		return true
 	}
 	return false
+}
+
+func styled(b tele.Btn, s tele.ButtonStyle) tele.Btn {
+	b.Style = s
+	return b
 }

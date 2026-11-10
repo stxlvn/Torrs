@@ -452,7 +452,7 @@ func offerCueSplit(c tele.Context, fc cueFileCtx, m *cueMatch, auto bool) error 
 
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(
-		markup.Row(markup.Data(fmt.Sprintf("🎼 Нарезать на %d треков", len(pcs.Cuts)), "\fcuesplit", fc.Hash, fc.fileHash())),
+		markup.Row(styled(markup.Data(fmt.Sprintf("🎼 Нарезать на %d треков", len(pcs.Cuts)), "\fcuesplit", fc.Hash, fc.fileHash()), tele.ButtonStyleSuccess)),
 		markup.Row(markup.Data("📄 Загрузить свой CUE", "\fcueup", fc.Hash, dh)),
 		markup.Row(markup.Data(skipLabel(fc.Oversized, false), "\fcueskip", fc.Hash, fc.fileHash())),
 	)
@@ -568,7 +568,7 @@ func sendCueGroupPrompt(c tele.Context, group *PendingCueGroup, fc cueFileCtx, g
 	dh := registerCueDir(c, fc)
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(
-		markup.Row(markup.Data(fmt.Sprintf("🎼 Нарезать всё (%d треков)", total), "\fcuegsplit", fc.Hash, groupHash)),
+		markup.Row(styled(markup.Data(fmt.Sprintf("🎼 Нарезать всё (%d треков)", total), "\fcuegsplit", fc.Hash, groupHash), tele.ButtonStyleSuccess)),
 		markup.Row(markup.Data("📄 Загрузить свой CUE", "\fcueup", fc.Hash, dh)),
 		markup.Row(markup.Data(skipLabel(false, true), "\fcuegskip", fc.Hash, groupHash)),
 	)
