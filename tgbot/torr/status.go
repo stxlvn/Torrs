@@ -146,7 +146,7 @@ func editRich(bot tele.API, msg *tele.Message, richHTML string, markup map[strin
 		payload["reply_markup"] = markup
 	}
 	_, err := bot.Raw("editMessageText", payload)
-	if err == nil || strings.Contains(err.Error(), "message is not modified") {
+	if err == nil || strings.Contains(err.Error(), "message is not modified") || strings.Contains(err.Error(), "canceled by new edit") {
 		return true
 	}
 	if strings.Contains(err.Error(), "rich") || strings.Contains(err.Error(), "method not found") || strings.Contains(err.Error(), "can't parse") {
